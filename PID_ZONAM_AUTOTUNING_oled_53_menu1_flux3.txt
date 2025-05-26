@@ -1,0 +1,2843 @@
+**asegurate de no modificar este archivo**
+
+1- adapta el programa de menu 1 al programa peincipal de forma que no interfiera con el 
+actual 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+**programa principal**
+
+
+
+
+/*
+ * Archivo: main.cpp
+ * Descripción: Este archivo contiene todo el código necesario para el control del sistema. 
+ *              Es el único archivo del proyecto y debe ser completamente autónomo.
+ * 
+ * Restricciones:
+ * - No se deben crear ni incluir otros archivos.
+ * - Todo el código debe residir exclusivamente en este archivo.
+ * - El control del motor debe realizarse únicamente a través del setpoint (target_rps) gestionado por el PID.
+ * - No se debe escribir PWM directamente en las salidas del motor.
+ */
+
+ #include <Arduino.h>
+ #include <EEPROM.h>
+ #include <Wire.h>
+ #include <Adafruit_GFX.h>
+ #include <Adafruit_SSD1306.h>
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ #include "freertos/semphr.h"
+ 
+// Variables para el manejo del encoder en núcleo dedicado
+TaskHandle_t encoderTaskHandle = NULL;
+SemaphoreHandle_t encoderSemaphore = NULL;
+volatile long _encoder_count = 0;  // Variable protegida para conteo del encoder
+volatile long encoder_delta = 0;   // Para cálculo de velocidad
+long encoder_count = 0;  // Interfaz compatible con el código existente
+
+// Prototipos de funciones del encoder
+long getEncoderCount();
+float getEncoderRPS();
+void resetEncoderCount();
+void actualizarEncoderCount();
+
+// Prototipos para menús
+void mostrarMenuVelocidadesCierre();
+void mostrarMenuParametrosPID();
+void mostrarMenuCalibracion();
+void mostrarMenuConfiguracion();
+void manejarMenuVelocidadesApertura();
+int leerMovimientoEncoder();
+ 
+ // Estructura para sincronización entre núcleos
+ struct EncoderData {
+   long count;
+   long last_count;
+   unsigned long last_time;
+   float current_rps;
+   bool data_ready;
+ };
+ 
+ // Instancia de datos del encoder sincronizados
+ EncoderData encoderSharedData = {0, 0, 0, 0.0, false};
+ 
+ // Configuración del encoder
+ int encoder_ppr = 600; // 600 PPR por defecto
+ 
+ // Definiciones del display
+ #define SCREEN_WIDTH 128
+ #define SCREEN_HEIGHT 64
+ #define OLED_RESET -1
+ #define SCREEN_ADDRESS 0x3C
+ 
+ Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+ 
+ // Pines del sistema
+ #define MOTOR_OPEN_PIN 14
+ #define MOTOR_CLOSE_PIN 27
+ #define ENCODER_A_PIN 15
+ #define ENCODER_B_PIN 16
+ #define LIMITE_ABIERTO_PIN 12
+ #define LIMITE_CERRADO_PIN 5
+ #define VOLTAGE_PIN 35
+ 
+ // Pines para el encoder de navegación
+ #define MENU_ENC_A 22
+ #define MENU_ENC_B 23
+ #define MENU_BTN 21
+ 
+ // Configuración PWM
+ const int pwmFreq = 20000;
+ const int pwmResolution = 8;
+ const int pwmChannelOpen = 0;
+ const int pwmChannelClose = 1;
+ 
+ // Variables del encoder
+ 
+ // Variables de control PID
+ float Kp = 0.0001, Ki = 0.001, Kd = 50;
+ float integral = 0.0, lastError = 0.0;
+ float target_rps = 0.0;
+ float current_rps = 0.0;
+ float last_output = 0.0;
+ 
+ // Variables de tiempo
+ unsigned long last_time = 0;
+ const int UPDATE_TIME = 100;
+ 
+ // Direcciones EEPROM
+ #define EEPROM_KP_ADDR 0
+ #define EEPROM_KI_ADDR 4
+ #define EEPROM_KD_ADDR 8
+ #define EEPROM_DEADZONE_ADDR 12
+ 
+ // Constantes de control
+ const float MAX_RPS = 63.33;
+ float deadzone = 35.0;
+ int deadzone_open = 35;
+ int deadzone_close = 35;
+ const float MARGIN_PERCENT = 3.0;  // Margen de ±3% para límites
+ const float MIN_PWM_FOR_MOVEMENT = 45.0;
+ 
+ // Variables para reconocimiento
+ bool reconocimiento_completado = false;
+ long apertura_total = 0;
+ const float velocidad_reconocimiento = 1.0;
+ long ultima_posicion = 0;
+ int etapa_actual = 0;
+ unsigned long tiempo_sin_movimiento = 0;
+ const int MIN_PULSOS_VALIDOS = 500;
+ bool inicio_reportado = false;
+ 
+ // Velocidades de cierre
+ const float VC1 = 3.0;   // (0-15%)
+ const float VC2 = 10.0;  // (15-35%)
+ const float VC3 = 20.0;  // (35-50%)
+ const float VC4 = 40.0;  // (50-70%)
+ const float VC5 = 25.0;  // (70-85%)
+ const float VC6 = 10.0;  // (85-95%)
+ const float VC7 = 2.0;   // (95-100%)
+ 
+ // Porcentajes de activación para cierre
+ const float PERCENT_CLOSE_1 = 15.0;
+ const float PERCENT_CLOSE_2 = 35.0;
+ const float PERCENT_CLOSE_3 = 50.0;
+ const float PERCENT_CLOSE_4 = 70.0;
+ const float PERCENT_CLOSE_5 = 85.0;
+ const float PERCENT_CLOSE_6 = 95.0;
+ const float PERCENT_CLOSE_7 = 100.0;
+ 
+ // Variables para rastrear la velocidad actual
+ float current_open_speed = 0.0;
+ float current_close_speed = VC1;
+ int current_open_stage = 1;
+ int current_close_stage = 1;
+ bool last_direction_was_opening = false;
+ 
+ // Variables para la navegación
+ volatile int menuPosition = 0;
+ volatile int lastMenuPosition = 0;
+ bool buttonPressed = false;
+ bool lastButtonState = HIGH;
+ unsigned long lastButtonPress = 0;
+ const unsigned long DEBOUNCE_DELAY = 50;
+ 
+ // Estados del menú
+ enum MenuState {
+     STARTUP_SCREEN,   // Pantalla principal
+     MENU_VELOCIDADES_APERTURA,  // Menú 1: Ajuste velocidades apertura (VA1-VA7)
+     MENU_VELOCIDADES_CIERRE,    // Menú 2: Ajuste velocidades cierre (VC1-VC7)
+     MENU_PARAMETROS_PID,        // Menú 3: Ajuste parámetros PID
+     MENU_CALIBRACION,           // Menú 4: Calibración
+     MENU_CONFIGURACION          // Menú 5: Configuración general
+ };
+
+ // Variable global para seguimiento del menú actual
+ MenuState currentMenu = STARTUP_SCREEN;
+
+ // Variable para la opción seleccionada dentro del menú actual
+ int menuSeleccionado = 0;
+
+ // Declaración de estructura PIDParams
+ struct PIDParams {
+     float Kp;
+     float Ki;
+     float Kd;
+     float velocidad_umbral;
+ };
+ 
+ // Variables para PID adaptativo
+ float Kp_actual = 0.0;
+ float Ki_actual = 0.0;
+ float Kd_actual = 0.0;
+ float factor_apertura = 1.0; // Factor de ajuste para dirección de apertura
+ float factor_cierre = 1.0; // Factor de ajuste para dirección de cierre
+ 
+ // Declarar el arreglo de parámetros
+ PIDParams conjuntos_parametros[4]; // Almacena los conjuntos de parámetros
+ 
+ // Variables para cambio de pantalla
+ bool cambio_pantalla_pendiente = false;
+ const unsigned long TIEMPO_ESPERA_CAMBIO_PANTALLA = 3000; // 3 segundos
+ 
+ // Variables para la interfaz de usuario y navegación
+ int simboloSeleccionado = 0;
+ bool seleccionActiva = false;
+ unsigned long ultimoMovimientoEncoder = 0;
+ const unsigned long TIEMPO_INACTIVIDAD = 3000; // 3 segundos sin actividad
+ bool force_display_update = false;
+ unsigned long last_display_update = 0;
+ const unsigned long DISPLAY_UPDATE_INTERVAL = 500; // Actualización pantalla (ms)
+ unsigned long tiempo_reconocimiento_completado = 0;
+ 
+ // Estructura y definición del menú
+ struct MenuItem {
+     const char* text;
+     bool selected;
+ };
+ 
+ // Menú principal
+ const int MENU_ITEMS = 3;
+ MenuItem mainMenu[MENU_ITEMS] = {
+     {"Configuración", false},
+     {"Calibración", false},
+     {"Regresar", false}
+ };
+ 
+// Variables dinámicas para las velocidades y porcentajes
+int velocidades[7] = {0, 0, 0, 0, 0, 0, 0}; // Valores iniciales de VA1 a VA7
+int porcentajes[7] = {0, 0, 0, 0, 0, 0, 0}; // Porcentajes iniciales de activación de VA1 a VA7
+
+// Variables para la navegación y edición
+bool enModoEdicion = false; // Indica si estamos en modo edición
+unsigned long ultimoParpadeo = 0; // Control del parpadeo
+bool mostrarValor = true; // Alternar entre mostrar/ocultar el valor durante el parpadeo
+
+ // Función para ajustar parámetros PID según velocidad
+ void ajustarParametrosPID(float setpoint) {
+     float velocidad_abs = abs(setpoint);
+     
+     // Base para ajustes dinámicos
+     int indice_conjunto = 0;
+     
+     // Seleccionar conjunto de parámetros según velocidad
+     for (int i = 3; i >= 0; i--) {
+         if (velocidad_abs >= conjuntos_parametros[i].velocidad_umbral) {
+             indice_conjunto = i;
+             break;
+         }
+     }
+     
+     // Valores base del conjunto seleccionado
+     Kp_actual = conjuntos_parametros[indice_conjunto].Kp;
+     Ki_actual = conjuntos_parametros[indice_conjunto].Ki;
+     Kd_actual = conjuntos_parametros[indice_conjunto].Kd;
+     
+     // Adaptaciones adicionales:
+     
+     // 1. Posición en el ciclo (más precisión cerca de límites)
+     float position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+     position_percent = constrain(position_percent, 0.0, 100.0);
+     
+     // Adaptación según posición
+     if (position_percent < 10.0 || position_percent > 90.0) {
+         // Cerca de límites: más precisión, menos oscilaciones
+         Kp_actual *= 1.2;  // +20% para control más preciso
+         Kd_actual *= 0.8;  // -20% para evitar oscilaciones
+     }
+     
+     // 2. Adaptación por dirección (apertura vs cierre)
+     if (setpoint < 0) { // Apertura
+         Kp_actual *= factor_apertura; 
+     } else if (setpoint > 0) { // Cierre - AÑADIR ESTA CONDICIÓN
+         Kp_actual *= factor_cierre;  // Usar un factor equivalente para cierre
+     }
+     
+     // 3. Adaptación por velocidad para estabilidad
+     if (velocidad_abs < 1.0) {
+         // A muy baja velocidad, aumentar control proporcional
+         Kp_actual *= 1.5;
+         Ki_actual *= 0.8; // Menor integración para evitar oscilaciones a baja velocidad
+     } else if (velocidad_abs > 30.0) {
+         // A velocidad muy alta, reducir efecto derivativo para evitar oscilaciones
+         Kd_actual *= 0.5;
+     }
+ }
+ 
+ // Declaración de funciones
+ void applyPWM(int pwmOpen, int pwmClose, bool ignorarTargetRps);
+ float calculateRPS();
+ void ajustarParametrosPID(float setpoint);
+ 
+ void guardarParametrosPID(PIDParams parametros[]); // Añadir esta línea
+ void cargarParametrosPID(); // Añadir esta línea
+ 
+ // Prototipos para autotuning
+ void autoTune();
+ void IRAM_ATTR encoderISR();
+ void encoderProcessingTask(void *pvParameters);
+ long getEncoderCount();
+ float getEncoderRPS();
+ void actualizarEncoderCount();
+ void resetEncoderCount(); // Añadir esta línea
+ bool mostrarResumenAutotuningSafe(int pagina, float val1, float val2, float val3, float val4, float val5);
+ void mostrarAnimacionGuardadoSafe();
+ bool guardarValoresPID();
+ 
+ // Cargar parámetros PID desde EEPROM
+ void cargarParametrosPID() {
+     EEPROM.get(EEPROM_KP_ADDR, Kp);
+     EEPROM.get(EEPROM_DEADZONE_ADDR, deadzone);
+     
+     // Validación de valores
+     if (isnan(Kp) || Kp <= 0.0 || Kp > 10.0) Kp = 0.01;
+     if (isnan(Ki) || Ki < 0.0 || Ki > 1.0) Ki = 0.001;
+     if (isnan(Kd) || Kd < 0.0 || Kd > 100.0) Kd = 50.0;
+     if (isnan(deadzone) || deadzone < 5.0 || deadzone > 100.0) deadzone = 35.0;
+     
+     // Conjuntos de parámetros para diferentes regímenes de velocidad
+     conjuntos_parametros[0] = {Kp * 1.5f, Ki * 0.8f, Kd * 1.2f, 0.0f};  // Muy baja velocidad
+     conjuntos_parametros[1] = {Kp * 1.2f, Ki, Kd * 1.0f, 1.0f};         // Baja velocidad
+     conjuntos_parametros[2] = {Kp, Ki * 1.2f, Kd * 0.8f, 5.0f};         // Media velocidad
+     conjuntos_parametros[3] = {Kp * 0.8f, Ki * 1.5f, Kd * 0.5f, 20.0f}; // Alta velocidad
+     
+     Serial.printf("PID cargado: Kp=%.5f, Ki=%.5f, Kd=%.2f, deadzone=%.1f\n", Kp, Ki, Kd, deadzone);
+ }
+  
+  // Variables para la lectura de voltaje
+  float voltage_raw = 0.0;
+  float voltage_scaled = 0.0;
+  
+  // Memoria de valores anteriores para evitar actualizaciones innecesarias
+  struct DisplayMemory {
+      float last_target_rps;
+      float last_current_rps;
+      int last_pwm_open;
+      int last_pwm_close;
+      long last_encoder_count;
+      float last_position_percent;
+      bool last_limite_abierto;
+      bool last_limite_cerrado;
+  };
+  
+  // Instancia de DisplayMemory
+  DisplayMemory displayMem = {-999, -999, -1, -1, -999999, -999, false, false};
+  
+  // Declaración de funciones
+  void applyPWM(int pwmOpen, int pwmClose, bool ignorarTargetRps);
+  float calculateRPS();
+ float calculatePID(float setpoint, float input);
+  void processCommand(String cmd);
+  void ejecutarReconocimiento();
+  void mostrarPantallaReconocimiento();
+  void mostrarPantallaInicio();
+  void setupDisplay();
+  void resetControlVariables();
+  void cicloAbrir();
+  void cicloReapertura();
+  void cicloCerrar();
+  void detenerMotor();
+  void activarLimiteAbierto();
+  void activarLimiteCerrado();
+  void verificarLimites();
+  float getVelocidadApertura(float porcentaje);
+  float getVelocidadCierre(float porcentaje);
+  void IRAM_ATTR menuEncoderISR();
+  void handleMenu();
+  void drawMenuScreen();
+  String determinarVelocidad(float target_rps);
+  void mostrarEstadoElevador(float position_percent);
+  void mostrarValoresPrincipales(float target_rps, float current_rps, long encoder_count, float position_percent);
+  bool debounceButton();
+  bool debeActualizarPantalla(bool forzar);
+  void manejarSeleccionSimbolos();
+  void manejarBotonSeleccion();
+  
+// Mostrar menú de velocidades de cierre
+void mostrarMenuVelocidadesCierre() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    
+    // Título
+    oledDisplay.setCursor(0, 0);
+    oledDisplay.println("MENU 2: VELOC. CIERRE");
+    
+    // Opción "SIGUIENTE"
+    if (menuSeleccionado == 0) {
+        oledDisplay.fillRect(0, 15, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    } else {
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    }
+    oledDisplay.setCursor(2, 17);
+    oledDisplay.println("SIGUIENTE >");
+    
+    // Opción "VOLVER"
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    if (menuSeleccionado == 1) {
+        oledDisplay.fillRect(0, 30, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    }
+    oledDisplay.setCursor(2, 32);
+    oledDisplay.println("< VOLVER");
+    
+    oledDisplay.display();
+}
+
+// Mostrar menú de velocidades de apertura
+void mostrarMenuVelocidadesApertura() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+
+    // Mostrar las velocidades y porcentajes en columnas a la izquierda
+    for (int i = 0; i < 7; i++) {
+        // Resaltar el elemento seleccionado
+        if (menuSeleccionado == i && !enModoEdicion) {
+            oledDisplay.fillRect(0, 8 + (i * 8), 80, 8, SSD1306_WHITE);
+            oledDisplay.setTextColor(SSD1306_BLACK);
+        } else {
+            oledDisplay.setTextColor(SSD1306_WHITE);
+        }
+
+        // Mostrar el nombre, valor y porcentaje sin puntos decimales
+        oledDisplay.setCursor(0, 8 + (i * 8));
+        oledDisplay.printf("va%d: v%d %%%.2d", i + 1, velocidades[i], porcentajes[i]);
+    }
+
+    // Palabras en las filas correspondientes
+    oledDisplay.setCursor(80, 8);  // Fila de va1
+    oledDisplay.println("Ciclo de");
+    oledDisplay.setCursor(80, 16); // Fila de va2
+    oledDisplay.println("apertura:");
+    oledDisplay.setCursor(80, 32); // Fila de va4
+    oledDisplay.println("V: veloci");
+    oledDisplay.setCursor(80, 40); // Fila de va5
+    oledDisplay.println("%: activa");
+
+    // Mostrar el símbolo ">" en la esquina inferior derecha
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    if (menuSeleccionado == 7) {
+        oledDisplay.fillRect(112, 56, 16, 8, SSD1306_WHITE); // Fondo resaltado
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    }
+    oledDisplay.setCursor(112, 56); // Posición en la esquina inferior derecha
+    oledDisplay.println(">");
+
+    oledDisplay.display();
+}
+
+// Mostrar menú de parámetros PID
+void mostrarMenuParametrosPID() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    
+    // Título
+    oledDisplay.setCursor(0, 0);
+    oledDisplay.println("MENU 3: PARAMETROS PID");
+    
+    // Opción "SIGUIENTE"
+    if (menuSeleccionado == 0) {
+        oledDisplay.fillRect(0, 15, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    } else {
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    }
+    oledDisplay.setCursor(2, 17);
+    oledDisplay.println("SIGUIENTE >");
+    
+    // Opción "VOLVER"
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    if (menuSeleccionado == 1) {
+        oledDisplay.fillRect(0, 30, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    }
+    oledDisplay.setCursor(2, 32);
+    oledDisplay.println("< VOLVER");
+    
+    oledDisplay.display();
+}
+
+// Mostrar menú de calibración
+void mostrarMenuCalibracion() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    
+    // Título
+    oledDisplay.setCursor(0, 0);
+    oledDisplay.println("MENU 4: CALIBRACION");
+    
+    // Opción "SIGUIENTE"
+    if (menuSeleccionado == 0) {
+        oledDisplay.fillRect(0, 15, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    } else {
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    }
+    oledDisplay.setCursor(2, 17);
+    oledDisplay.println("SIGUIENTE >");
+    
+    // Opción "VOLVER"
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    if (menuSeleccionado == 1) {
+        oledDisplay.fillRect(0, 30, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    }
+    oledDisplay.setCursor(2, 32);
+    oledDisplay.println("< VOLVER");
+    
+    oledDisplay.display();
+}
+
+// Mostrar menú de configuración
+void mostrarMenuConfiguracion() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    
+    // Título
+    oledDisplay.setCursor(0, 0);
+    oledDisplay.println("MENU 5: CONFIGURACION");
+    
+    // Opción "SIGUIENTE"
+    if (menuSeleccionado == 0) {
+        oledDisplay.fillRect(0, 15, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    } else {
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    }
+    oledDisplay.setCursor(2, 17);
+    oledDisplay.println("SIGUIENTE >");
+    
+    // Opción "VOLVER"
+    oledDisplay.setTextColor(SSD1306_WHITE);
+    if (menuSeleccionado == 1) {
+        oledDisplay.fillRect(0, 30, 128, 12, SSD1306_WHITE);
+        oledDisplay.setTextColor(SSD1306_BLACK);
+    }
+    oledDisplay.setCursor(2, 32);
+    oledDisplay.println("< VOLVER");
+    
+    oledDisplay.display();
+}
+
+// Manejar menú de velocidades de apertura
+void manejarMenuVelocidadesApertura() {
+    // Control del parpadeo
+    if (millis() - ultimoParpadeo >= (enModoEdicion ? 200 : 500)) {
+        ultimoParpadeo = millis();
+        mostrarValor = !mostrarValor;
+    }
+
+    // Si estamos en modo edición, ajustar el valor seleccionado
+    if (enModoEdicion) {
+        int movimiento = leerMovimientoEncoder(); // Leer movimiento del encoder
+        if (movimiento != 0) {
+            if (menuSeleccionado < 7) {
+                velocidades[menuSeleccionado] = constrain(velocidades[menuSeleccionado] + movimiento, 0, 255);
+            } else {
+                porcentajes[menuSeleccionado] = constrain(porcentajes[menuSeleccionado] + movimiento, 0, 100);
+            }
+        }
+
+        // Salir del modo edición al presionar el botón
+        if (debounceButton()) {
+            enModoEdicion = false;
+        }
+    } else {
+        // Navegar entre los elementos con el encoder (cíclico)
+        int movimiento = leerMovimientoEncoder();
+        if (movimiento != 0) {
+            menuSeleccionado = (menuSeleccionado + movimiento + 8) % 8; // Cíclico entre 0 y 7
+        }
+
+        // Entrar en modo edición al presionar el botón
+        if (debounceButton() && menuSeleccionado < 7) {
+            enModoEdicion = true;
+        }
+
+        // Si se selecciona ">", ir al siguiente menú
+        if (debounceButton() && menuSeleccionado == 7) {
+            currentMenu = MENU_VELOCIDADES_CIERRE; // Cambiar al siguiente menú
+        }
+    }
+
+    // Mostrar el menú actualizado
+    mostrarMenuVelocidadesApertura();
+}
+  
+ // Interrupción optimizada del encoder
+ void IRAM_ATTR encoderISR() {
+     static uint8_t last_state = 0;
+     
+     // Lectura directa de pines con máscara de bits para mayor velocidad
+     uint8_t current_state = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+     uint8_t combined = (last_state << 2) | current_state;
+     
+     // Tabla de decisión para contar en vez de condicionales múltiples
+     // Es más rápida y menos propensa a problemas de timing
+     switch(combined) {
+         // Incrementos horarios (00-01, 01-11, 11-10, 10-00)
+         case 0b0001:
+         case 0b0111:
+         case 0b1110:
+         case 0b1000:
+             _encoder_count++;
+             break;
+             
+         // Incrementos antihorarios (00-10, 10-11, 11-01, 01-00)
+         case 0b0010:
+         case 0b1011:
+         case 0b1101:
+         case 0b0100:
+             _encoder_count--;
+             break;
+     }
+     last_state = current_state;
+ }
+  
+  // Interrupción del encoder de menú
+  void IRAM_ATTR menuEncoderISR() {
+    static uint8_t lastState = 0;
+    static int pulseCount = 0;
+    uint8_t state = (digitalRead(MENU_ENC_A) << 1) | digitalRead(MENU_ENC_B);
+
+    switch(lastState | (state << 2)) {
+        case 0b0001:
+        case 0b1110:
+            pulseCount++;
+            if (pulseCount >= 4) { // Cada 4 pulsos cambia la posición
+                if (currentMenu == STARTUP_SCREEN && reconocimiento_completado) {
+                    // En la pantalla principal, cambiar símbolos
+                    simboloSeleccionado = (simboloSeleccionado + 1) % 3;
+                } else {
+                    // En los menús, alternar entre las opciones
+                    menuSeleccionado = (menuSeleccionado + 1) % 2;
+                }
+                seleccionActiva = true;
+                ultimoMovimientoEncoder = millis();
+                pulseCount = 0;
+            }
+            break;
+        case 0b0100:
+        case 0b1011:
+            pulseCount++;
+            if (pulseCount >= 4) { 
+                if (currentMenu == STARTUP_SCREEN && reconocimiento_completado) {
+                    // En la pantalla principal, cambiar símbolos
+                    simboloSeleccionado = (simboloSeleccionado > 0) ? simboloSeleccionado - 1 : 2;
+                } else {
+                    // En los menús, alternar entre las opciones
+                    menuSeleccionado = (menuSeleccionado > 0) ? 0 : 1;
+                }
+                seleccionActiva = true;
+                ultimoMovimientoEncoder = millis();
+                pulseCount = 0;
+            }
+            break;
+    }
+    lastState = state;
+}
+  
+  // Configuración inicial
+  void setup() {
+    // Inicializar comunicación serial
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n=== INICIANDO SISTEMA ===");
+    
+    // Paso 1: Inicializar EEPROM primero
+    EEPROM.begin(256);
+    
+    // Paso 2: Inicializar pantalla OLED (una sola vez)
+    Wire.begin(32, 33);
+    Wire.setClock(100000);
+    
+    bool displayInitialized = false;
+    for (int i = 0; i < 3 && !displayInitialized; i++) {
+        if (oledDisplay.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+            displayInitialized = true;
+            Serial.println("Pantalla OLED iniciada correctamente");
+            
+            // Mostrar mensaje inicial
+            oledDisplay.clearDisplay();
+            oledDisplay.setTextSize(1);
+            oledDisplay.setTextColor(SSD1306_WHITE);
+            oledDisplay.setCursor(0,0);
+            oledDisplay.println("Iniciando sistema...");
+            oledDisplay.display();
+        } else {
+            Serial.println("Error al inicializar SSD1306, reintentando...");
+            delay(500);
+        }
+    }
+    
+    if (!displayInitialized) {
+        Serial.println("Error crítico: No se pudo inicializar la pantalla OLED");
+        while (true);
+    }
+    
+    // Paso 3: Configurar pines GPIO (una sola vez)
+    pinMode(ENCODER_A_PIN, INPUT_PULLUP);
+    pinMode(ENCODER_B_PIN, INPUT_PULLUP);
+    pinMode(LIMITE_ABIERTO_PIN, OUTPUT);
+    pinMode(LIMITE_CERRADO_PIN, OUTPUT);
+    pinMode(VOLTAGE_PIN, INPUT);
+    pinMode(MENU_ENC_A, INPUT_PULLUP);
+    pinMode(MENU_ENC_B, INPUT_PULLUP);
+    pinMode(MENU_BTN, INPUT_PULLUP);
+    
+    // Paso 4: Configurar PWM
+    ledcSetup(pwmChannelOpen, pwmFreq, pwmResolution);
+    ledcSetup(pwmChannelClose, pwmFreq, pwmResolution);
+    ledcAttachPin(MOTOR_OPEN_PIN, pwmChannelOpen);
+    ledcAttachPin(MOTOR_CLOSE_PIN, pwmChannelClose);
+    
+    // Paso 5: Inicializar FreeRTOS (antes de las interrupciones)
+    encoderSemaphore = xSemaphoreCreateMutex();
+    
+    // Paso 6: Crear tarea de encoder en núcleo 0
+    xTaskCreatePinnedToCore(
+        encoderProcessingTask,  // Función a ejecutar
+        "EncoderTask",          // Nombre de la tarea
+        8192,                   // Tamaño de stack
+        NULL,                   // Parámetros
+        3,                      // Prioridad
+        &encoderTaskHandle,     // Handle de la tarea
+        0                       // Núcleo donde ejecutar (0)
+    );
+    
+    // Paso 7: Configurar interrupciones (solo una vez)
+    attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(MENU_ENC_A), menuEncoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(MENU_ENC_B), menuEncoderISR, CHANGE);
+    
+    // Paso 8: Cargar parámetros PID
+    cargarParametrosPID();
+    ajustarParametrosPID(0); // Inicializar con valores predeterminados
+    
+    // Paso 9: Preparar para reconocimiento
+    reconocimiento_completado = false;
+    etapa_actual = 0;
+    resetEncoderCount(); // Usar la función segura en lugar de asignar directamente
+    target_rps = -velocidad_reconocimiento;
+    tiempo_sin_movimiento = millis();
+    ultima_posicion = 0;
+    
+    // Aplicar valores iniciales seguros
+    last_time = millis();
+    deadzone_open = 45;
+    deadzone_close = 45;
+    applyPWM(0, 0, false);
+    
+    Serial.println("Inicialización completada, comenzando reconocimiento...");
+    
+    // IMPORTANTE: No llamar a mostrarPantallaInicio() aquí - se llamará desde loop()
+}
+  
+  // Bucle principal
+  void loop() {
+     // Actualizar encoder_count desde el núcleo dedicado (primero)
+     actualizarEncoderCount();
+     
+     // Resto del código existente...
+     unsigned long current_time = millis();
+     
+     // NUEVO: Procesar comandos seriales al inicio para permitir interrumpir cualquier proceso
+     if (Serial.available()) {
+         processCommand(Serial.readStringUntil('\n'));
+     }
+     
+     // Verificar límites y activar pines
+     verificarLimites();
+  
+      // Calcular posición en porcentaje
+      float position_percent = 0.0;
+      if (apertura_total != 0) {
+          position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+          position_percent = constrain(position_percent, 0.0, 100.0);
+      }
+  
+      // Detener motor al alcanzar exactamente los límites
+      if (position_percent >= 100.0 && target_rps > 0) {
+          detenerMotor();
+          Serial.println("Límite cerrado alcanzado - Motor detenido");
+      }
+  
+      if (position_percent <= 0.0 && target_rps < 0) {
+          if (reconocimiento_completado || etapa_actual != 1) {
+              detenerMotor();
+              Serial.println("Límite abierto alcanzado - Motor detenido");
+          }
+      }
+  
+      // Verificar límites y encoder
+      verificarLimites();
+  
+      // Manejar la selección de símbolos y botón
+      manejarSeleccionSimbolos();
+      manejarBotonSeleccion();
+  
+      // Gestionar el reconocimiento
+      if (!reconocimiento_completado) {
+          mostrarPantallaReconocimiento();
+          ejecutarReconocimiento();
+          return; // Esta salida temprana impedía procesar comandos durante el reconocimiento
+      }
+     
+     // Resto del código...
+  
+      // Manejar cambio de pantalla tras reconocimiento
+      if (cambio_pantalla_pendiente && 
+          (current_time - tiempo_reconocimiento_completado >= TIEMPO_ESPERA_CAMBIO_PANTALLA)) {
+          mostrarPantallaInicio();
+          cambio_pantalla_pendiente = false;
+          force_display_update = true;
+          return;
+      }
+  
+      // Actualizar el control PID
+      if (current_time - last_time >= UPDATE_TIME) {
+          // Calcular velocidad actual
+          float new_rps = calculateRPS();
+          float position_percent = 0.0;
+          
+          if (apertura_total != 0) {
+              position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+              position_percent = constrain(position_percent, 0.0, 100.0);
+              
+              // Ajustar velocidades según posición
+              if (reconocimiento_completado) {
+                  if (target_rps < 0) { // Apertura
+                      float nueva_velocidad = getVelocidadApertura(position_percent);
+                      if (abs(target_rps) != nueva_velocidad) {
+                          target_rps = -nueva_velocidad;
+                          Serial.printf("Cambio de velocidad apertura: %.1f%% -> VA%d (%.1f RPS)\n", 
+                                       position_percent, 8-current_open_stage, nueva_velocidad);
+                      }
+                  } else if (target_rps > 0) { // Cierre
+                      float nueva_velocidad = getVelocidadCierre(position_percent);
+                      if (abs(target_rps) != nueva_velocidad) {
+                          target_rps = nueva_velocidad;
+                          Serial.printf("Cambio de velocidad cierre: %.1f%% -> VC%d (%.1f RPS)\n", 
+                                       position_percent, current_close_stage, nueva_velocidad);
+                      }
+                  }
+              }
+          }
+          
+          // Control automático de límites
+          if (reconocimiento_completado) {
+              if (position_percent >= 100.0 && target_rps > 0) {
+                  target_rps = 0;
+                  Serial.println("Posición cerrada alcanzada - Motor detenido");
+              }
+  
+              // Señales de límite
+              digitalWrite(LIMITE_CERRADO_PIN, (position_percent >= (100.0 - MARGIN_PERCENT) && 
+                                              position_percent <= (100.0 + MARGIN_PERCENT)));
+              digitalWrite(LIMITE_ABIERTO_PIN, (position_percent <= MARGIN_PERCENT));
+          }
+  
+          // Actualizar RPS actual
+          if (abs(new_rps - current_rps) > 0.05) {
+              current_rps = new_rps;
+          }
+  
+          // Calcular y aplicar PWM
+          float pwm_output = calculatePID(target_rps, current_rps);
+          int pwm_close = (pwm_output > 0) ? pwm_output : 0;
+          int pwm_open = (pwm_output < 0) ? -pwm_output : 0;
+          applyPWM(pwm_open, pwm_close, false);
+          
+          // Imprimir estado
+          Serial.printf("SET: %+05.1f RPS: %+05.1f PWM_C: %03d PWM_A: %03d POS: %05.1f%% LIM_C: %s LIM_A: %s VEL: %s\n",
+              target_rps,
+              current_rps,
+              pwm_close,
+              pwm_open,
+              position_percent,
+              digitalRead(LIMITE_CERRADO_PIN) ? "ON " : "OFF",
+              digitalRead(LIMITE_ABIERTO_PIN) ? "ON " : "OFF",
+              determinarVelocidad(target_rps).c_str()
+          );
+          
+          last_time = current_time;
+      }
+  
+      // Procesar comandos
+      if (Serial.available()) {
+          processCommand(Serial.readStringUntil('\n'));
+      }
+  
+      // Gestión de menús y pantallas en loop principal
+      if (!reconocimiento_completado || cambio_pantalla_pendiente) {
+          mostrarPantallaReconocimiento();
+      } else {
+          switch (currentMenu) {
+              case STARTUP_SCREEN:
+                  mostrarPantallaInicio();
+                  break;
+              case MENU_VELOCIDADES_APERTURA:
+                  manejarMenuVelocidadesApertura();
+                  break;
+              case MENU_VELOCIDADES_CIERRE:
+                  mostrarMenuVelocidadesCierre();
+                  break;
+              case MENU_PARAMETROS_PID:
+                  mostrarMenuParametrosPID();
+                  break;
+              case MENU_CALIBRACION:
+                  mostrarMenuCalibracion();
+                  break;
+              case MENU_CONFIGURACION:
+                  mostrarMenuConfiguracion();
+                  break;
+              default:
+                  mostrarPantallaInicio();
+                  break;
+          }
+      }
+  
+      // Lectura de voltaje
+      voltage_raw = analogRead(VOLTAGE_PIN);
+      voltage_scaled = voltage_raw * (24.0 / 4095.0);
+  }
+  
+  // Control de velocidad y dirección
+  void applyPWM(int pwmOpen, int pwmClose, bool ignorarTargetRps) {
+    // Variables estáticas para rastrear la dirección anterior
+    static int lastPwmOpen = 0;
+    static int lastPwmClose = 0;
+    static int previousDirection = 0; // 0=detenido, 1=apertura, 2=cierre
+    
+    // Determinar dirección actual solicitada
+    int currentDirection = 0;
+    if (pwmOpen > 0) currentDirection = 1;
+    if (pwmClose > 0) currentDirection = 2;
+    
+    // Detectar cambio de dirección
+    bool direction_change = (previousDirection != 0 && 
+                           currentDirection != 0 && 
+                           previousDirection != currentDirection);
+    
+    if (direction_change) {
+        // Permitir cambio inmediato en caso de cambio de dirección
+        lastPwmOpen = pwmOpen;
+        lastPwmClose = pwmClose;
+        Serial.println("Cambio de dirección detectado - aplicando cambio inmediato");
+    } else {
+        // Aplicar cambio gradual normal
+        const int maxPwmChangeRate = 3; // máximo cambio por ciclo
+        
+        if (pwmOpen > lastPwmOpen + maxPwmChangeRate) {
+            pwmOpen = lastPwmOpen + maxPwmChangeRate;
+        } else if (pwmOpen < lastPwmOpen - maxPwmChangeRate) {
+            pwmOpen = lastPwmOpen - maxPwmChangeRate;
+        }
+        
+        if (pwmClose > lastPwmClose + maxPwmChangeRate) {
+            pwmClose = lastPwmClose + maxPwmChangeRate;
+        } else if (pwmClose < lastPwmClose - maxPwmChangeRate) {
+            pwmClose = lastPwmClose - maxPwmChangeRate;
+        }
+        
+        lastPwmOpen = pwmOpen;
+        lastPwmClose = pwmClose;
+    }
+    
+    // Actualizar la dirección anterior
+    previousDirection = currentDirection;
+    
+    // Aplicar PWM
+    ledcWrite(pwmChannelOpen, pwmOpen);
+    ledcWrite(pwmChannelClose, pwmClose);
+}
+  
+ // Función calculateRPS usando los datos procesados en núcleo dedicado
+ float calculateRPS() {
+     static float last_reported_rps = 0;
+     float rps = getEncoderRPS();
+     
+     // Solo actualizar si cambió significativamente
+     if (abs(rps - last_reported_rps) > 0.05) {
+         last_reported_rps = rps;
+     }
+     
+     return last_reported_rps;
+ }
+  
+  /*
+   * ============================================================================
+   * ALGORITMO DE CONTROL PID
+   * ============================================================================
+   * DESCRIPCIÓN:
+   * Este algoritmo implementa un controlador PID (Proporcional-Integral-Derivativo)
+   * para regular con precisión la velocidad del motor en ambas direcciones.
+   * 
+   * FUNCIONAMIENTO:
+   * 1. Recibe un setpoint (velocidad objetivo en RPS) y un input (velocidad actual).
+   * 2. Calcula el error (diferencia entre el setpoint y la velocidad actual).
+   * 3. Genera una salida PWM combinando tres términos:
+   *    - P (Proporcional): Responde proporcionalmente al error actual (Kp).
+   *    - I (Integral): Acumula el error a lo largo del tiempo para eliminar errores persistentes (Ki).
+   *    - D (Derivativo): Anticipa cambios futuros basado en la tasa de cambio del error (Kd).
+   * 
+   * GESTIÓN DE ZONA MUERTA:
+   * - La zona muerta es el valor mínimo de PWM necesario para vencer la inercia del motor.
+   * - Para dirección de apertura (valores negativos): Se usa deadzone_open como punto inicial.
+   * - Para dirección de cierre (valores positivos): Se usa deadzone_close como punto inicial.
+   * - Este valor se suma/resta a la salida del PID para garantizar que se supere la inercia inicial.
+   * 
+   * MECANISMO DE APLICACIÓN DE ZONA MUERTA (SISTEMA DE TRES CAPAS):
+   * 1. CAPA PID: La función calculatePID() añade el valor de zona muerta directamente a la 
+   *    salida calculada dependiendo de la dirección detectada:
+   *    - Si output > 0: Se suma deadzone_close → output += deadzone_close 
+   *    - Si output < 0: Se resta deadzone_open → output -= deadzone_open
+   *    Este ajuste garantiza que la señal PWM sea siempre suficiente para iniciar el movimiento.
+   *
+   * 2. CAPA SETPOINT: En las funciones cicloAbrir() y cicloCerrar() se modifica el setpoint
+   *    (velocidad objetivo) incorporando un factor de compensación basado en la zona muerta:
+   *    - Apertura: target_rps -= (float)deadzone_open / encoder_ppr
+   *    - Cierre: target_rps += (float)deadzone_close / encoder_ppr
+   *    Esta pre-compensación provoca que el PID genere una salida más agresiva desde el inicio.
+   *
+   * 3. CAPA SEGURIDAD: En la función applyPWM() se implementa una última verificación que
+   *    asegura que si se va a aplicar algún PWM, éste sea al menos el valor de zona muerta:
+   *    - Si pwmOpen > 0: pwmOpen = max(pwmOpen, (int)deadzone)
+   *    - Si pwmClose > 0: pwmClose = max(pwmClose, (int)deadzone)
+   *
+   * OBTENCIÓN DE VALORES DE ZONA MUERTA:
+   * Los valores deadzone_open y deadzone_close se determinan mediante el proceso de autotuning
+   * donde se incrementa gradualmente el PWM hasta detectar movimiento en el encoder.
+   * La función autoTune() detecta estos valores y los almacena en la EEPROM para uso futuro.
+   * 
+   * ALMACENAMIENTO DE VALORES:
+   * - Los parámetros del PID (Kp, Ki, Kd) y zonas muertas se guardan en EEPROM.
+   * - Direcciones EEPROM:
+   *   * 0-3: Kp (proporcional)
+   *   * 4-7: Ki (integral)
+   *   * 8-11: Kd (derivativo)
+   *   * 12-15: Zona muerta promedio
+   * 
+   * LIMITACIONES IMPLEMENTADAS:
+   * 1. Valor integral restringido (-30 a +30) para evitar wind-up y oscilaciones.
+   * 2. Cambios graduales en la salida (máx. ±5 por ciclo) para evitar movimientos bruscos.
+   * 3. Salida limitada al rango válido de PWM (-255 a +255).
+   * 4. Valores por defecto seguros si ocurre algún error en los parámetros.
+   * 
+   * ============================================================================
+   * ADVERTENCIA: NO MODIFICAR ESTA FUNCIÓN SIN COMPRENDER COMPLETAMENTE
+   * SUS IMPLICACIONES EN EL CONTROL DEL MOTOR Y LA SEGURIDAD DEL SISTEMA.
+   * ============================================================================
+   */
+  float calculatePID(float setpoint, float input) {
+     // Adaptación de parámetros según velocidad objetivo
+     ajustarParametrosPID(setpoint);
+     
+     // No movimiento si el setpoint es cercano a 0
+     if (abs(setpoint) < 0.01) {
+         return 0;
+     }
+ 
+     float error = setpoint - input;
+     
+     // Zona muerta para errores pequeños (evita microoscilaciones)
+     if (abs(error) < 0.05) {
+         error = 0;
+     }
+     
+     // Términos PID con ganancias adaptativas
+     float p_term = error * Kp_actual;
+     
+     // Integración con anti-windup adaptativo
+     float max_integral = 30.0 * (abs(setpoint) < 1.0 ? 0.5 : 1.0);
+     integral += error * Ki_actual;
+     integral = constrain(integral, -max_integral, max_integral);
+     float i_term = integral;
+ 
+     // Término derivativo con filtrado adaptativo
+     float filter_factor = abs(setpoint) > 10.0 ? 0.7 : 0.3;
+     float filtered_error_change = filter_factor * (error - lastError);
+     float d_term = filtered_error_change * Kd_actual;
+     lastError = error;
+ 
+     // Calcular salida PID básica
+     float output = p_term + i_term + d_term;
+ 
+     // IMPLEMENTACIÓN SIMPLIFICADA: ZONA MUERTA COMO PUNTO CERO ABSOLUTO
+     if (output > 0) { // Para cierre
+         output = deadzone_close + output;
+     } else if (output < 0) { // Para apertura
+         output = -deadzone_open + output;
+     }
+ 
+     // Control de cambios rápidos adaptativo
+     float max_change = abs(setpoint) > 10.0 ? 10.0 : 5.0;
+     if (output - last_output > max_change) {
+         output = last_output + max_change;
+     } else if (output - last_output < -max_change) {
+         output = last_output - max_change;
+     }
+     
+     last_output = output;
+     return constrain(output, -255, 255);
+ }
+  
+  // Procesar comandos seriales
+  void processCommand(String cmd) {
+     cmd.trim();
+     if (cmd == "t" || cmd == "T") {
+         autoTune();
+     } else if (cmd == "p" || cmd == "P") {
+         target_rps = 0.0;
+         applyPWM(0, 0, false);
+         resetControlVariables();
+     } else if (cmd == "a" || cmd == "A") {
+         if (reconocimiento_completado) {
+             // CORRECCIÓN: Abrir solo si NO está ya abierto (encoder_count > 0)
+             if (encoder_count > 0) {  // Condición correcta: posición abierta = 0
+                 cicloAbrir();
+                 Serial.println("Iniciando ciclo de apertura");
+             } else {
+                 Serial.println("Ya está en posición abierta");
+             }
+         } else {
+             Serial.println("Error: Ejecute primero el reconocimiento");
+         }
+     } else if (cmd == "c" || cmd == "C") {
+         if (reconocimiento_completado) {
+             // CORRECCIÓN: Cerrar solo si NO está ya cerrado (encoder_count < apertura_total)
+             if (encoder_count < apertura_total) {  // Condición correcta: cerrado = apertura_total
+                 cicloCerrar();  // Usar la función dedicada que incluye todas las protecciones
+                 Serial.println("Iniciando cierre");
+             } else {
+                 Serial.println("Ya está en posición cerrada");
+             }
+         } else {
+             Serial.println("Error: Ejecute primero el reconocimiento");
+         }
+     } else {
+         // Comando numérico para setpoint directo
+         float new_target = cmd.toFloat();
+         if (abs(new_target) <= MAX_RPS) {
+             target_rps = new_target;
+             Serial.printf("Nuevo objetivo: %.2f RPS\n", new_target);
+         }
+     }
+ }
+  
+  // Resetear variables de control
+  void resetControlVariables() {
+      integral = 0.0;
+      lastError = 0.0;
+      
+      // También es importante reiniciar last_output para evitar transiciones bruscas
+      // Esto ayuda a prevenir el problema de movimiento en dirección contraria
+      last_output = 0.0;
+  }
+  
+  // Función para obtener la velocidad de apertura según posición
+  float getVelocidadApertura(float porcentaje) {
+      last_direction_was_opening = true;
+      return 0.0; // Eliminado el cálculo de velocidades de apertura
+  }
+  
+  // Función para obtener la velocidad de cierre según posición
+  float getVelocidadCierre(float porcentaje) {
+     // Resetear el estado si estamos al inicio del cierre
+     if (porcentaje < 5.0) {
+         current_close_stage = 1;
+         current_close_speed = VC1;
+     }
+     
+     // Usar lógica simple de comparación directa (sin dependencia del estado anterior)
+     if (porcentaje < PERCENT_CLOSE_1) {
+         return VC1;  // Velocidad inicial más baja (3.0 RPS)
+     } else if (porcentaje < PERCENT_CLOSE_2) {
+         return VC2;  // Velocidad moderada (10.0 RPS)
+     } else if (porcentaje < PERCENT_CLOSE_3) {
+         return VC3;  // Y así sucesivamente...
+     } else if (porcentaje < PERCENT_CLOSE_4) {
+         return VC4;
+     } else if (porcentaje < PERCENT_CLOSE_5) {
+         return VC5;
+     } else if (porcentaje < PERCENT_CLOSE_6) {
+         return VC6;
+     } else {
+         return VC7;  // Velocidad final (2.0 RPS)
+     }
+ }
+  
+  // Mostrar los valores principales en la pantalla
+  void mostrarValoresPrincipales(float target_rps, float current_rps, long encoder_count, float position_percent) {
+      // Línea 1: SET y voltaje
+      oledDisplay.setCursor(0, 0);
+      oledDisplay.printf("SET:%02.0f V:%05.2f", abs(target_rps), voltage_scaled);
+      
+      // Línea 2: RPS y límites
+      oledDisplay.setCursor(0, 10);
+      if (digitalRead(LIMITE_CERRADO_PIN)) {
+          oledDisplay.printf("RPS:%02.0f LIMIC:ON", abs(current_rps));
+      } else if (digitalRead(LIMITE_ABIERTO_PIN)) {
+          oledDisplay.printf("RPS:%02.0f LIMIA:ON", abs(current_rps));
+      } else {
+          oledDisplay.printf("RPS:%02.0f", abs(current_rps));
+      }
+      
+      // Línea 3: PWM
+      oledDisplay.setCursor(0, 20);
+      oledDisplay.printf("PWC:%03d PWA:%03d", ledcRead(pwmChannelClose), ledcRead(pwmChannelOpen));
+      
+      // Línea 4: Pulsos
+      oledDisplay.setCursor(0, 30);
+      oledDisplay.printf("PULSOS:%ld", encoder_count);
+  
+      // Línea 5: Estado de la puerta
+      oledDisplay.setCursor(0, 40);
+      if (position_percent >= (100.0 - MARGIN_PERCENT)) {
+          oledDisplay.print("CERRADO");
+      } else if (position_percent <= MARGIN_PERCENT) {
+          oledDisplay.print("ABIERTO");
+      } else {
+          oledDisplay.printf("%02.0f%%", position_percent);
+      }
+  }
+  
+  // Mostrar el estado del elevador gráficamente
+  void mostrarEstadoElevador(float position_percent) {
+      // Dimensiones del elevador
+      int doorWidth = 30;
+      int doorHeight = SCREEN_HEIGHT;
+      int doorX = SCREEN_WIDTH - doorWidth - 5;
+      int doorY = 0;
+      
+      // Dibujar el marco exterior
+      oledDisplay.drawRect(doorX, doorY, doorWidth, doorHeight, SSD1306_WHITE);
+      
+      // Calcular la apertura de las puertas
+      int doorOpenWidth = int((doorWidth - 4) * (100.0 - position_percent) / 100.0);
+      int doorHalfOpen = doorOpenWidth / 2;
+      
+      // Dibujar las dos puertas
+      if (position_percent < 100.0) {
+          // Puerta izquierda
+          oledDisplay.fillRect(doorX + 2, doorY + 2, 
+                             (doorWidth - 4) / 2 - doorHalfOpen, 
+                             doorHeight - 4, SSD1306_WHITE);
+          
+          // Puerta derecha
+          oledDisplay.fillRect(doorX + 2 + (doorWidth - 4) / 2 + doorHalfOpen, 
+                             doorY + 2, 
+                             (doorWidth - 4) / 2 - doorHalfOpen, 
+                             doorHeight - 4, SSD1306_WHITE);
+      } else {
+          // Puertas cerradas
+          oledDisplay.fillRect(doorX + 2, doorY + 2, doorWidth - 4, doorHeight - 4, SSD1306_WHITE);
+          
+          // Línea de unión
+          int centerX = doorX + doorWidth / 2;
+          oledDisplay.drawLine(centerX, doorY + 3, centerX, doorY + doorHeight - 3, SSD1306_BLACK);
+      }
+  }
+  
+  // Determinar qué velocidad mostrar
+  String determinarVelocidad(float target_rps) {
+      if (!reconocimiento_completado) {
+          return "REC";
+      }
+      
+      if (abs(target_rps) < 0.1) {
+          return "";
+      }
+      
+      float absSpeed = abs(target_rps);
+      if (target_rps < 0) { // Apertura
+          return "";
+      } else { // Cierre
+          if (absSpeed >= VC7) return "VC7";
+          else if (absSpeed >= VC6) return "VC6";
+          else if (absSpeed >= VC5) return "VC5";
+          else if (absSpeed >= VC4) return "VC4";
+          else if (absSpeed >= VC3) return "VC3";
+          else if (absSpeed >= VC2) return "VC2";
+          else return "VC1";
+      }
+  }
+  
+  // Mostrar pantalla de inicio
+  void mostrarPantallaInicio() {
+     // Verificar si realmente necesitamos actualizar
+     bool datos_cambiados = false;
+     
+     float position_percent = 0.0;
+     if (apertura_total != 0) {
+         position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+         position_percent = constrain(position_percent, 0.0, 100.0);
+     }
+     
+     // Solo actualizar si hay cambios significativos
+     if (force_display_update ||
+         abs(displayMem.last_target_rps - target_rps) > 0.1 ||
+         abs(displayMem.last_current_rps - current_rps) > 0.1 ||
+         abs(displayMem.last_position_percent - position_percent) > 0.5 ||
+         ledcRead(pwmChannelClose) != displayMem.last_pwm_close ||
+         ledcRead(pwmChannelOpen) != displayMem.last_pwm_open ||
+         abs(displayMem.last_encoder_count - encoder_count) > 10) {
+         
+         datos_cambiados = true;
+         
+         // Actualizar la memoria de valores
+         displayMem.last_target_rps = target_rps;
+         displayMem.last_current_rps = current_rps;
+         displayMem.last_pwm_close = ledcRead(pwmChannelClose);
+         displayMem.last_pwm_open = ledcRead(pwmChannelOpen);
+         displayMem.last_encoder_count = encoder_count;
+         displayMem.last_position_percent = position_percent;
+         displayMem.last_limite_abierto = digitalRead(LIMITE_ABIERTO_PIN);
+         displayMem.last_limite_cerrado = digitalRead(LIMITE_CERRADO_PIN);
+         
+         // Ahora sí actualizar la pantalla
+         oledDisplay.clearDisplay();
+         oledDisplay.setTextSize(1);
+         oledDisplay.setTextColor(SSD1306_WHITE);
+         
+         // Determinar qué velocidad mostrar
+         String velocidadStr = determinarVelocidad(target_rps);
+         
+         // Mostrar la interfaz
+         mostrarValoresPrincipales(target_rps, current_rps, encoder_count, position_percent);
+         mostrarEstadoElevador(position_percent);
+         
+         // Mostrar símbolos de navegación con resaltado
+         if (reconocimiento_completado) {
+             // Posiciones para los tres símbolos en la esquina inferior izquierda
+             int pos1 = 10;   // Símbolo Abrir "<>"
+             int pos2 = 35;   // Símbolo Cerrar "><" 
+             int pos3 = 60;   // Símbolo Siguiente ">"
+             
+             // Dibujar símbolos en parte inferior izquierda
+             oledDisplay.setCursor(0, 56);
+             
+             // Símbolo para "Abrir" (<>)
+             if (seleccionActiva && simboloSeleccionado == 0) {
+                 // Versión resaltada (fondo blanco, texto negro)
+                 oledDisplay.fillRect(pos1-5, 54, 12, 10, SSD1306_WHITE);
+                 oledDisplay.setTextColor(SSD1306_BLACK);
+                 oledDisplay.setCursor(pos1-5, 55);
+                 oledDisplay.print("<>");
+                 oledDisplay.setTextColor(SSD1306_WHITE);
+             } else {
+                 // Versión normal (fondo negro, texto blanco)
+                 oledDisplay.setCursor(pos1-5, 55);
+                 oledDisplay.print("<>");
+             }
+             
+             // Símbolo para "Cerrar" (><)
+             if (seleccionActiva && simboloSeleccionado == 1) {
+                 // Versión resaltada
+                 oledDisplay.fillRect(pos2-5, 54, 12, 10, SSD1306_WHITE);
+                 oledDisplay.setTextColor(SSD1306_BLACK);
+                 oledDisplay.setCursor(pos2-5, 55);
+                 oledDisplay.print("><");
+                 oledDisplay.setTextColor(SSD1306_WHITE);
+             } else {
+                 // Versión normal
+                 oledDisplay.setCursor(pos2-5, 55);
+                 oledDisplay.print("><");
+             }
+             
+             // Símbolo para "Siguiente/Menú" (>)
+             if (seleccionActiva && simboloSeleccionado == 2) {
+                 // Versión resaltada
+                 oledDisplay.fillRect(pos3-2, 54, 6, 10, SSD1306_WHITE);
+                 oledDisplay.setTextColor(SSD1306_BLACK);
+                 oledDisplay.setCursor(pos3-2, 55);
+                 oledDisplay.print(">");
+                 oledDisplay.setTextColor(SSD1306_WHITE);
+             } else {
+                 // Versión normal
+                 oledDisplay.setCursor(pos3-2, 55);
+                 oledDisplay.print(">");
+             }
+             
+             // Posición para mostrar la velocidad actual
+             int posVel = 75;  // A la derecha del símbolo ">"
+             
+             // Obtener y mostrar la velocidad actual
+             if (velocidadStr.length() > 0) {
+                 oledDisplay.setCursor(posVel, 55);
+                 oledDisplay.print(velocidadStr);
+             }
+         }
+         
+         // Solo actualizar el display si algo ha cambiado realmente
+         if (datos_cambiados) {
+             oledDisplay.display();
+         }
+     }
+     
+     // Siempre desactivar la bandera de actualización forzada
+     force_display_update = false;
+ }
+  
+  // Inicializar pantalla OLED
+  void setupDisplay() {
+      Wire.begin(32, 33);
+      delay(100);
+      
+      for (int i = 0; i < 3; i++) {
+          if (oledDisplay.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+              Serial.println(F("Pantalla OLED iniciada correctamente"));
+              oledDisplay.clearDisplay();
+              oledDisplay.setTextSize(1);
+              oledDisplay.setTextColor(SSD1306_WHITE);
+              oledDisplay.setCursor(0, 0);
+              oledDisplay.println(F("Inicializando..."));
+              oledDisplay.display();
+              delay(1000);
+              return;
+          }
+          Serial.println(F("Error al inicializar SSD1306, reintentando..."));
+          delay(1000);
+      }
+  
+      Serial.println(F("Error crítico: No se pudo inicializar la pantalla OLED"));
+      while (true);
+  }
+  
+  // Mostrar pantalla de reconocimiento
+  void mostrarPantallaReconocimiento() {
+      static int last_etapa_actual = -1;
+      static long last_encoder_count = -1;
+      static int last_progreso = -1;
+      static bool last_reconocimiento_completado = false;
+      static unsigned long ultima_actualizacion = 0;
+      
+      unsigned long tiempo_actual = millis();
+      if (tiempo_actual - ultima_actualizacion < 250 && 
+          etapa_actual == last_etapa_actual && 
+          encoder_count == last_encoder_count && 
+          !reconocimiento_completado) {
+          return;
+      }
+      ultima_actualizacion = tiempo_actual;
+      
+      // Calcular progreso
+      int progreso = 0;
+      if (reconocimiento_completado) {
+          progreso = 100;
+      } else if (etapa_actual == 1) {
+          progreso = map(abs(encoder_count), 0, MIN_PULSOS_VALIDOS, 0, 50);
+      } else if (etapa_actual == 2) {
+          progreso = 50 + map(abs(encoder_count), 0, apertura_total > 0 ? apertura_total : MIN_PULSOS_VALIDOS, 0, 49);
+      }
+      progreso = constrain(progreso, 0, 99);
+  
+      // Actualizar solo si hay cambios
+      if (etapa_actual != last_etapa_actual || 
+          encoder_count != last_encoder_count || 
+          progreso != last_progreso || 
+          reconocimiento_completado != last_reconocimiento_completado) {
+          
+          oledDisplay.clearDisplay();
+  
+          // Dibujar contenido
+          oledDisplay.setCursor(0, 0);
+          oledDisplay.print("AUTO-APRENDIZAJE");
+          oledDisplay.setCursor(0, 16);
+          oledDisplay.printf("ETAPA: %s", (etapa_actual == 1) ? "APERTURA" : (etapa_actual == 2) ? "CIERRE" : "COMPLETADO");
+          oledDisplay.setCursor(0, 28);
+          oledDisplay.printf("PULSOS: %ld", encoder_count);
+          oledDisplay.setCursor(0, 40);
+          oledDisplay.printf("PROGRESO: %d%%", progreso);
+  
+          // Barra de progreso
+          int barraAncho = 100;
+          int barraProgreso = (progreso * barraAncho) / 100;
+          oledDisplay.drawRect(0, 50, barraAncho, 10, SSD1306_WHITE);
+          oledDisplay.fillRect(0, 50, barraProgreso, 10, SSD1306_WHITE);
+  
+          oledDisplay.display();
+  
+          // Actualizar valores previos
+          last_etapa_actual = etapa_actual;
+          last_encoder_count = encoder_count;
+          last_progreso = progreso;
+          last_reconocimiento_completado = reconocimiento_completado;
+      }
+  }
+  
+  /*
+  * ============================================================================
+  * PROCESO DE RECONOCIMIENTO AUTOMÁTICO DE APERTURA
+  * ============================================================================
+  * DESCRIPCIÓN:
+  * Este algoritmo realiza un reconocimiento completo del recorrido de apertura
+  * y cierre de la puerta, determinando los límites de operación y guardando
+  * la apertura total en la memoria EEPROM para su uso posterior.
+  * 
+  * PRINCIPIO DE CONTROL FUNDAMENTAL:
+  * - El sistema SOLO proporciona velocidades de referencia FIJAS (target_rps)
+  * - NO se implementan curvas de aceleración o desaceleración
+  * - El PID es el ÚNICO responsable de gestionar el motor
+  * - La velocidad se mantiene constante durante cada etapa:
+  *   * Etapa 1 (Apertura): target_rps = -velocidad_reconocimiento
+  *   * Etapa 2 (Cierre): target_rps = velocidad_reconocimiento
+  *   * Etapa 3 (Finalización): target_rps = 0
+  *
+  * CORRECCIÓN CRÍTICA IMPLEMENTADA:
+  * - En la etapa 2 (cierre), se garantiza que pwm_close siempre sea positivo mediante abs(pwm_output)
+  * - Este cambio asegura que no haya conflictos de dirección ni arranques bruscos
+  * 
+  * ETAPAS DEL RECONOCIMIENTO:
+  * 0. INICIALIZACIÓN: Preparación de variables
+  * 1. APERTURA: Detección de límite abierto con velocidad fija negativa
+  * 2. CIERRE: Medición de recorrido con velocidad fija positiva
+  * 3. FINALIZACIÓN: Almacenamiento de resultados
+  * 
+  * ============================================================================
+  */
+ void ejecutarReconocimiento() {
+     // Reemplazar encoder_count con getEncoderCount()
+     long current_count = getEncoderCount();
+     
+     static unsigned long tiempo_ultimo_incremento = millis();
+     static long ultima_posicion = current_count;
+     static unsigned long tiempo_ultimo_calculo = 0;
+     static int intentos_fallidos = 0;
+     const int MAX_INTENTOS = 3;
+     const unsigned long TIEMPO_SIN_INCREMENTO = 200; // 200ms sin movimiento para detectar límite
+     
+     // Calcular velocidad actual y detectar movimiento
+     unsigned long tiempo_actual = millis();
+     
+     // Actualizar variables de seguimiento cada 50ms
+     if (tiempo_actual - tiempo_ultimo_calculo >= 50) {
+         long delta_pulsos = abs(current_count - ultima_posicion);
+         
+         if (delta_pulsos > 1) {
+             tiempo_ultimo_incremento = tiempo_actual;
+         }
+         
+         // Registro de movimiento para diagnóstico
+         if (delta_pulsos > 0) {
+             Serial.printf("Movimiento detectado: %ld pulsos, dirección: %s\n", 
+                         delta_pulsos, 
+                         (current_count > ultima_posicion) ? "+" : "-");
+         }
+         
+         // Detección de límite por tiempo sin movimiento (200ms)
+         bool limite_detectado = false;
+         if (tiempo_actual - tiempo_ultimo_incremento >= TIEMPO_SIN_INCREMENTO) {
+             limite_detectado = true;
+             Serial.printf("Límite mecánico detectado: %ums sin incremento\n", TIEMPO_SIN_INCREMENTO);
+             
+             // Detener motor inmediatamente
+             ledcWrite(pwmChannelOpen, 0);
+             ledcWrite(pwmChannelClose, 0);
+         }
+         
+         // Procesar detección de límite cuando corresponda
+         if (limite_detectado) {
+             switch (etapa_actual) {
+                 case 1: // Límite abierto detectado
+                     target_rps = 0;
+                     Serial.println("====== Límite ABIERTO detectado ======");
+                     
+                     // Reemplazar el encoder_count = 0 simple por la función segura
+                     resetEncoderCount();
+                     
+                     ultima_posicion = 0;
+                     etapa_actual = 2;
+                     intentos_fallidos = 0;
+                     delay(3000);
+                     target_rps = velocidad_reconocimiento; // VALOR FIJO positivo para cierre
+                     Serial.println("====== Iniciando movimiento hacia límite cerrado ======");
+                     tiempo_ultimo_incremento = millis();
+                     break;
+                 
+                 case 2: // Límite cerrado detectado
+                     target_rps = 0;
+                     if (abs(current_count) >= MIN_PULSOS_VALIDOS) {
+                         apertura_total = abs(current_count);
+                         EEPROM.put(24, apertura_total);
+                         EEPROM.commit();
+                         Serial.println("\n====== RECONOCIMIENTO COMPLETADO ======");
+                         Serial.printf("APERTURA TOTAL: %ld pulsos\n", apertura_total);
+                         reconocimiento_completado = true;
+                         etapa_actual = 3;
+                         tiempo_reconocimiento_completado = millis();
+                         cambio_pantalla_pendiente = true;
+                         force_display_update = true;
+                         inicio_reportado = false;
+                     } else {
+                         Serial.println("Pulsos insuficientes, reintentando...");
+                         etapa_actual = 0;
+                         intentos_fallidos++;
+                         if (intentos_fallidos >= MAX_INTENTOS) {
+                             Serial.println("Error: Demasiados intentos fallidos. Usando valor mínimo de seguridad.");
+                             apertura_total = MIN_PULSOS_VALIDOS;
+                             reconocimiento_completado = true;
+                             etapa_actual = 3;
+                         }
+                     }
+                     break;
+             }
+             
+             ultima_posicion = current_count;
+             tiempo_ultimo_calculo = tiempo_actual;
+             return;
+         }
+         
+         ultima_posicion = current_count;
+         tiempo_ultimo_calculo = tiempo_actual;
+     }
+     
+     // Lógica principal - SOLO ESTABLECE VALORES TARGET_RPS FIJOS
+     switch (etapa_actual) {
+         case 0:  // Inicio
+             if (!inicio_reportado) {
+                 Serial.println("\n====== AUTO-APRENDIZAJE INICIADO ======");
+                 inicio_reportado = true;
+                 resetEncoderCount();
+                 ultima_posicion = 0;
+                 target_rps = -velocidad_reconocimiento; // VALOR FIJO negativo para apertura
+                 intentos_fallidos = 0;
+                 tiempo_ultimo_incremento = millis();
+             }
+             etapa_actual = 1;
+             break;
+ 
+         case 1:  // Apertura - VALOR FIJO negativo
+             target_rps = -velocidad_reconocimiento;
+             break;
+ 
+         case 2:  // Cierre - CORREGIDO: VALOR FIJO positivo (consistente con resto del código)
+             target_rps = velocidad_reconocimiento;  // Valor POSITIVO para cierre (convención estándar)
+             break;
+     }
+ 
+     // Control del motor - PID se encarga del arranque y control
+     float pwm_output = calculatePID(target_rps, current_rps);
+     
+     // Asignación de canales CORREGIDA con garantía de valores positivos:
+     int pwm_open = 0;
+     int pwm_close = 0;
+     
+     // Este código ya funciona correctamente, pero podría ser más claro:
+     if (target_rps < 0) {  // Apertura (valor negativo)
+         pwm_open = -pwm_output;  // Canal de apertura (convertir a positivo)
+         pwm_close = 0;
+     } else if (target_rps > 0) {  // Cierre (valor positivo)
+         pwm_open = 0;
+         pwm_close = abs(pwm_output);  // SOLUCIÓN: garantizar valor positivo
+     }
+     
+     // Asegurar PWM mínimo para mover el motor
+     if (pwm_open > 0) {
+         pwm_open = max(pwm_open, (int)deadzone_open + 15);
+     }
+     if (pwm_close > 0) {
+         pwm_close = max(pwm_close, (int)deadzone_close + 15);
+     }
+     
+     // Aplicar PWM directamente
+     ledcWrite(pwmChannelOpen, pwm_open);
+     ledcWrite(pwmChannelClose, pwm_close);
+     
+     // Log detallado para diagnóstico con absolutos para claridad
+     Serial.printf("Reconocimiento: target_rps=%.2f, current_rps=%.2f, PWM_output=%.2f, PWM_open=%d, PWM_close=%d\n", 
+                  target_rps, current_rps, pwm_output, pwm_open, pwm_close);
+ }
+  
+ // Manejar menú - CORREGIDO: solo una definición correcta
+ void handleMenu() {
+     oledDisplay.setCursor(0,0);
+     
+     for (int i = 0; i < MENU_ITEMS; i++) {
+         if (mainMenu[i].selected) {
+             oledDisplay.fillRect(0, i*10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+             oledDisplay.setTextColor(SSD1306_BLACK);
+         } else {
+             oledDisplay.setTextColor(SSD1306_WHITE);
+         }
+         oledDisplay.setCursor(2, i*10+1);
+         oledDisplay.print(mainMenu[i].text);
+     }
+     
+     oledDisplay.display();
+ }
+  
+  // Manejar debounce de botón
+  bool debounceButton() {
+    static unsigned long lastPressTime = 0;
+    static unsigned long lastReleaseTime = 0; 
+    static bool lastButtonState = HIGH;
+    static bool buttonStateReported = false;
+    
+    bool currentButtonState = digitalRead(MENU_BTN);
+
+    // Para depuración - eliminar o comentar esta línea en producción
+    // Serial.printf("Estado actual botón: %s, último: %s, reported: %s\n", 
+    //     currentButtonState == LOW ? "PULSADO" : "LIBERADO",
+    //     lastButtonState == LOW ? "PULSADO" : "LIBERADO",
+    //     buttonStateReported ? "TRUE" : "FALSE");
+
+    // Detectar cambio físico en el botón
+    if (currentButtonState != lastButtonState) {
+        // Botón presionado (HIGH->LOW)
+        if (currentButtonState == LOW) {
+            if ((millis() - lastReleaseTime) > 50) {
+                lastPressTime = millis();
+                buttonStateReported = false;  // Permitir nueva detección
+                Serial.println("Botón físicamente presionado");
+            }
+        } 
+        // Botón liberado (LOW->HIGH)
+        else {
+            lastReleaseTime = millis();
+            // CLAVE: Resetear flag cuando se libera el botón
+            buttonStateReported = false;
+            Serial.println("Botón liberado y listo para siguiente pulsación");
+        }
+        lastButtonState = currentButtonState;
+    }
+
+    // La acción se ejecuta solo una vez por pulsación física 
+    // pero se resetea cuando se libera el botón
+    if (currentButtonState == LOW && !buttonStateReported && 
+        (millis() - lastPressTime) > 50) {
+        buttonStateReported = true;
+        Serial.println(">> ACCIÓN DE BOTÓN EJECUTADA <<");
+        return true;
+    }
+
+    return false;
+}
+  
+  // Determinar si se debe actualizar pantalla
+  bool debeActualizarPantalla(bool forzar) {
+      unsigned long current_time = millis();
+      
+      if (forzar || current_time - last_display_update >= DISPLAY_UPDATE_INTERVAL) {
+          last_display_update = current_time;
+          return true;
+      }
+      
+      return false;
+  }
+  
+  // Manejar selección de símbolos
+  void manejarSeleccionSimbolos() {
+      if (millis() - ultimoMovimientoEncoder > TIEMPO_INACTIVIDAD) {
+          seleccionActiva = false;
+      }
+      
+      if (!seleccionActiva || !reconocimiento_completado) {
+          return;
+      }
+      
+      if (currentMenu == STARTUP_SCREEN) {
+          static int last_simbolo = -1;
+          if (last_simbolo != simboloSeleccionado) {
+              last_simbolo = simboloSeleccionado;
+              force_display_update = true;
+          }
+      }
+  }
+  
+  // Manejar acción de botón de selección
+  void manejarBotonSeleccion() {
+    // Si no hay selección activa o no se ha completado el reconocimiento, salir
+    if (!reconocimiento_completado) {
+        return;
+    }
+    
+    // Solo actuar cuando se detecte una pulsación real del botón
+    if (debounceButton()) {
+        Serial.println("Botón presionado - Acción detectada");
+        
+        // Solo procesar acciones si hay una selección activa
+        if (currentMenu == STARTUP_SCREEN) {
+            if (seleccionActiva) {  // Verificación CRÍTICA
+                switch (simboloSeleccionado) {
+                    case 0: // Abrir
+                        cicloAbrir();
+                        Serial.println("Iniciando ciclo apertura desde UI");
+                        break;
+                    case 1: // Cerrar
+                        cicloCerrar();
+                        Serial.println("Iniciando ciclo cierre desde UI");
+                        break;
+                    case 2: // Menú
+                        currentMenu = MENU_VELOCIDADES_APERTURA;
+                        menuSeleccionado = 0;
+                        Serial.println("Accediendo al menú: VELOCIDADES_APERTURA");
+                        force_display_update = true;
+                        break;
+                }
+            }
+        } else {
+            // En menús internos
+            if (menuSeleccionado == 0) { // SIGUIENTE
+                MenuState menuAnterior = currentMenu;
+                
+                switch (currentMenu) {
+                    case MENU_VELOCIDADES_APERTURA:
+                        currentMenu = MENU_VELOCIDADES_CIERRE;
+                        break;
+                    case MENU_VELOCIDADES_CIERRE:
+                        currentMenu = MENU_PARAMETROS_PID;
+                        break;
+                    case MENU_PARAMETROS_PID:
+                        currentMenu = MENU_CALIBRACION;
+                        break;
+                    case MENU_CALIBRACION:
+                        currentMenu = MENU_CONFIGURACION;
+                        break;
+                    case MENU_CONFIGURACION:
+                        currentMenu = STARTUP_SCREEN;
+                        break;
+                }
+                Serial.printf("Cambio de menú: %d -> %d\n", menuAnterior, currentMenu);
+            } 
+            else if (menuSeleccionado == 1) { // VOLVER
+                currentMenu = STARTUP_SCREEN;
+                Serial.println("Volviendo a pantalla principal");
+            }
+            force_display_update = true;
+        }
+    }
+}
+  
+  // Verificar límites y activar señales
+  void verificarLimites() {
+      float position_percent = 0.0;
+      if (apertura_total != 0) {
+          position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+          position_percent = constrain(position_percent, 0.0, 100.0);
+      }
+  
+      digitalWrite(LIMITE_CERRADO_PIN, (position_percent >= (100.0 - MARGIN_PERCENT) && 
+                                        position_percent <= (100.0 + MARGIN_PERCENT)));
+      digitalWrite(LIMITE_ABIERTO_PIN, (position_percent <= MARGIN_PERCENT));
+  }
+  
+  // Ciclo de apertura
+  void cicloAbrir() {
+    // Detener por completo antes de iniciar nuevo ciclo
+    detenerMotor();
+    delay(50); // Pausa breve para estabilización
+    
+    // Reinicio de variables de control
+    resetControlVariables();
+    
+    // Calcular posición
+    float position_percent = 0.0;
+    if (apertura_total != 0) {
+        position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+        position_percent = constrain(position_percent, 0.0, 100.0);
+    }
+
+    if (position_percent <= 0) {
+        activarLimiteAbierto();
+        Serial.println("Posición abierta alcanzada");
+        return;
+    }
+
+    // Determinar velocidad según posición SIN compensación adicional
+    target_rps = 0.0; // Eliminado el cálculo de velocidades de apertura
+    
+    // Inicializar la integral para ayudar en el arranque sin modificar target
+    integral = -deadzone_open * 0.1;
+    
+    Serial.printf("Apertura iniciada: %.1f%% → %.1f RPS\n", position_percent, target_rps);
+    
+    // Marca dirección actual para referencia
+    last_direction_was_opening = true;
+}
+  
+  // Ciclo de reapertura
+  void cicloReapertura() {
+      target_rps = 0.0;
+      applyPWM(0, 0, false);
+      delay(100);
+  
+      float position_percent = 0.0;
+      if (apertura_total != 0) {
+          position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+          position_percent = constrain(position_percent, 0.0, 100.0);
+      }
+  
+      // Aplicar velocidad según posición
+      target_rps = 0.0; // Eliminado el cálculo de velocidades de apertura
+  
+      // Ajustar setpoint para incluir la zona muerta de abrir como punto inicial
+      target_rps -= (float)deadzone_open / encoder_ppr;
+      
+      target_rps = constrain(target_rps, -MAX_RPS, MAX_RPS);
+      Serial.printf("Reapertura iniciada: %.1f%% -> %.1f RPS\n", position_percent, target_rps);
+  }
+  
+  // Modificación del ciclo de cierre para garantizar aceleración suave
+void cicloCerrar() {
+    static bool inicio_cierre = true;
+    
+    // Detener por completo antes de iniciar nuevo ciclo
+    detenerMotor();
+    delay(50); // Pausa breve para estabilización
+    
+    // Reinicio de variables de control
+    resetControlVariables();
+    
+    // Calcular posición
+    float position_percent = 0.0;
+    if (apertura_total != 0) {
+        position_percent = (float)getEncoderCount() * 100.0 / apertura_total;
+        position_percent = constrain(position_percent, 0.0, 100.0);
+    }
+
+    if (position_percent >= 100) {
+        activarLimiteCerrado();
+        Serial.println("Posición cerrada alcanzada");
+        inicio_cierre = true;
+        return;
+    }
+
+    // Seleccionar velocidad según posición SIN compensación adicional
+    if (inicio_cierre) {
+        target_rps = VC1; // Velocidad inicial siempre VC1
+        inicio_cierre = false;
+        
+        Serial.printf("Iniciando ciclo cierre con VC1 (%.1f RPS) desde %.1f%%\n", 
+                     VC1, position_percent);
+    } else {
+        // Selección normal según posición
+        if (position_percent < PERCENT_CLOSE_1) {
+            target_rps = VC1;
+        } else if (position_percent < PERCENT_CLOSE_2) {
+            target_rps = VC2;
+        } else if (position_percent < PERCENT_CLOSE_3) {
+            target_rps = VC3;
+        } else if (position_percent < PERCENT_CLOSE_4) {
+            target_rps = VC4;
+        } else if (position_percent < PERCENT_CLOSE_5) {
+            target_rps = VC5;
+        } else if (position_percent < PERCENT_CLOSE_6) {
+            target_rps = VC6;
+        } else {
+            target_rps = VC7;
+        }
+    }
+    
+    // Inicializar la integral para ayudar en el arranque sin modificar target
+    integral = deadzone_close * 0.1;
+    
+    Serial.printf("Cierre iniciado: %.1f%% → %.1f RPS\n", position_percent, target_rps);
+    
+    // Marca dirección para referencia
+    last_direction_was_opening = false;
+}
+  
+  // Detener motor
+  void detenerMotor() {
+    // Determinar dirección actual del movimiento
+    float current_velocity = getEncoderRPS();
+    
+    // Si hay movimiento significativo, aplicar freno activo
+    if (abs(current_velocity) > 0.1) {
+        // Aplicar breve freno en dirección contraria
+        int freno_pwm = constrain(abs(current_velocity) * 20, 20, 40);
+        
+        if (current_velocity > 0) {  // Si está cerrando
+            ledcWrite(pwmChannelOpen, freno_pwm);
+            ledcWrite(pwmChannelClose, 0);
+        } else if (current_velocity < 0) {  // Si está abriendo
+            ledcWrite(pwmChannelOpen, 0);
+            ledcWrite(pwmChannelClose, freno_pwm);
+        }
+        
+        // Aplicar freno brevemente
+        delay(50);
+    }
+    
+    // Detener completamente el motor
+    ledcWrite(pwmChannelOpen, 0);
+    ledcWrite(pwmChannelClose, 0);
+    
+    // Establecer velocidad objetivo a cero
+    target_rps = 0.0;
+    
+    // Reiniciar TODAS las variables de control
+    resetControlVariables();
+    last_output = 0.0;  // Agregar esta línea, que es importante para mantener continuidad
+}
+  
+  // Activar límite abierto
+  void activarLimiteAbierto() {
+      digitalWrite(LIMITE_ABIERTO_PIN, HIGH);
+      digitalWrite(LIMITE_CERRADO_PIN, LOW);
+  }
+  
+  // Activar límite cerrado
+  void activarLimiteCerrado() {
+      digitalWrite(LIMITE_CERRADO_PIN, HIGH);
+      digitalWrite(LIMITE_ABIERTO_PIN, LOW);
+  }
+  
+  /*
+   * ============================================================================
+   * PROCESO DE AUTO-CALIBRACIÓN (AUTOTUNING)
+   * ============================================================================
+   * DESCRIPCIÓN:
+   * Este algoritmo realiza un proceso completo de calibración automática del motor,
+   * determinando los valores óptimos para zonas muertas y parámetros PID.
+   * 
+   * FASES DE CALIBRACIÓN:
+   * 1. Detección de zona muerta para APERTURA (PWM mínimo para iniciar movimiento).
+   * 2. Detección de zona muerta para CIERRE (PWM mínimo para iniciar movimiento).
+   * 3. Medición de velocidad real a 1 RPS en ambas direcciones.
+   * 4. Cálculo de parámetros PID óptimos basados en los resultados.
+   * 5. Almacenamiento de valores en EEPROM y presentación de resultados.
+   * 
+   * VISUALIZACIÓN EN PANTALLA:
+   * A) Pantalla de inicio (0,0 a 128,64):
+   *    - Línea 1 (y=0): "AUTOTUNING INICIADO"
+   *    - Línea 2 (y=10): Fase actual
+   *    - Línea 6 (y=54): "Espere por favor..."
+   * 
+   * B) Pantalla de detección Z/M (Fase 1 y 2):
+   *    - Encabezado (0,0): "FASE #: DETECCION Z/M"
+   *    - Subtítulo (0,10): "APERTURA/CIERRE (PWM->MOTOR)"
+   *    - Gráfica:
+   *      * Eje X (20,40 a 120,40): Representa valor PWM (0-255)
+   *      * Eje Y (20,20 a 20,40): Representa movimiento
+   *      * Etiquetas (5,20): "M" (movimiento) y (122,40): "P" (PWM)
+   *    - Valores actuales (0,45): "PWM: ###" y (0,55): "Pulsos: ###"
+   *    - Al detectar movimiento:
+   *      * Círculo en punto de detección (x_pos,40)
+   *      * Texto confirmación (0,45): "Z/M Abrir/Cerrar: ###"
+   *      * Cuenta regresiva (70,55): "Xs" (tiempo restante)
+   * 
+   * C) Pantalla de medición RPS (Fase 3):
+   *    - Encabezado (0,0): "FASE 3: CALIBRACION"
+   *    - Subtítulo (0,10): "Velocidad RPS"
+   *    - Dirección (0,30): "Cierre/Apertura (±1 RPS)"
+   *    - Cuenta regresiva (0,40): "Midiendo en #..."
+   *    - Durante medición (0,40): "RPS: +/-#.##"
+   *    - Pulsos actuales (0,50): "Pulsos: ###"
+   * 
+   * D) Pantalla de resultado PID:
+   *    - Encabezado (0,0): "AJUSTE PID"
+   *    - Valores previos->nuevos:
+   *      * (0,10): "Kp: #.#####->#.#####"
+   *      * (0,20): "Ki: #.#####->#.#####"
+   *      * (0,30): "Kd: #.##->#.##"
+   * 
+   * E) Pantalla de resumen (Página 1/2):
+   *    - Encabezado (0,0): "AUTOTUNING COMPLETO"
+   *    - Línea separadora (0,9 a 128,9)
+   *    - Resultados:
+   *      * (0,12): "Z/M Abrir: ###"
+   *      * (0,22): "Z/M Cerrar: ###"
+   *      * (0,32): "Z/M Prom: ##.#"
+   *      * (0,42): "RPS +/-: #.##/#.##"
+   *    - Indicador (0,54): "[ 1/2 ] Espere..."
+   * 
+   * F) Pantalla de resumen (Página 2/2):
+   *    - Encabezado (0,0): "PARAMETROS PID"
+   *    - Línea separadora (0,9 a 128,9)
+   *    - Valores:
+   *      * (0,12): "Kp: #.####"
+   *      * (0,22): "Ki: #.####"
+   *      * (0,32): "Kd: #.##"
+   *    - Barra de progreso (0,45 a 128,55) completada
+   *    - Indicador (0,56): "[ 2/2 ] Valores OK!"
+   * 
+   * G) Animación de guardado:
+   *    - Alternancia (0,56): "Guardando..." / "            "
+   *    - 5 ciclos con 300ms cada uno
+   * 
+   * TIEMPOS CLAVE DEL PROCESO:
+   * - Incremento PWM: 2 unidades cada 80ms
+   * - Confirmación movimiento: 3000ms (3s)
+   * - Pausa entre fases: 1000ms (1s)
+   * - Cuenta regresiva: 3s (1s por número)
+   * - Medición RPS: 3000ms por dirección
+   * - Visualización de resultados: 3000ms por página
+   * - Espera entre verificaciones: 100-200ms
+   * 
+   * CÁLCULOS Y PROCESAMIENTO:
+   * - Detección zona muerta: PWM donde encoder cambia >2 pulsos
+   * - Confirmación: >5 pulsos en 3s confirma movimiento real
+   * - Cálculo RPS: pulsos en 3s ÷ (3 × encoder_ppr)
+   * - Fórmulas PID automáticas:
+   * - Valores EEPROM:
+   * 
+   * CÁLCULOS Y PROCESAMIENTO:
+   * - Detección zona muerta: PWM donde encoder cambia >2 pulsos
+   * - Confirmación: >5 pulsos en 3s confirma movimiento real
+   * - Cálculo RPS: pulsos en 3s ÷ (3 × encoder_ppr)
+   * - Fórmulas PID automáticas:
+   * - Valores EEPROM:
+   *   * 0-3: Kp
+   *   * 4-7: Ki
+   *   * 8-11: Kd
+   *   * 12-15: Deadzone
+   * 
+   * ============================================================================
+   * ADVERTENCIA: NO MODIFICAR ESTA FUNCIÓN SIN COMPRENDER COMPLETAMENTE
+   * SUS IMPLICACIONES EN EL CONTROL DEL MOTOR Y LA SEGURIDAD DEL SISTEMA.
+   * ============================================================================
+   */
+ void autoTune() {
+    bool found_deadzone_open = false;
+    bool found_deadzone_close = false;
+    int pwm_open = 0;
+    int pwm_close = 0;
+    long prev_encoder_count = 0;
+    float rps_positive = 0.0;
+    float rps_negative = 0.0;
+    
+    try {
+        // Pantalla de inicio
+        oledDisplay.clearDisplay();
+        oledDisplay.setTextSize(1);
+        oledDisplay.setCursor(0, 0);
+        oledDisplay.println("AUTOTUNING INICIADO");
+        oledDisplay.setCursor(0, 10);
+        oledDisplay.println("Fase 1: Deteccion Z/M");
+        oledDisplay.setCursor(0, 54);
+        oledDisplay.println("Espere por favor...");
+        oledDisplay.display();
+        delay(1000);
+        
+        // ===== FASE 1: Detectar zona muerta para APERTURA =====
+        prev_encoder_count = encoder_count;
+        
+        // Preparar gráfica de progreso
+        oledDisplay.clearDisplay();
+        oledDisplay.setCursor(0, 0);
+        oledDisplay.setTextSize(2);
+        oledDisplay.println("Z/M ABRIR");
+        oledDisplay.setTextSize(1);
+        
+        oledDisplay.drawRect(20, 15, 100, 25, SSD1306_WHITE);
+        oledDisplay.setCursor(0, 15);
+        oledDisplay.print("0");
+        oledDisplay.setCursor(122, 15);
+        oledDisplay.print("255");
+        oledDisplay.setCursor(0, 40);
+        oledDisplay.print("PWM");
+        oledDisplay.display();
+        
+        int last_bar_width = 0;
+        
+        // MEJORA 1: Incremento más fino para mayor precisión
+        for (pwm_open = 0; pwm_open <= 255 && !found_deadzone_open; pwm_open += 1) {
+            // Aplicar PWM y esperar un tiempo razonable para observar efecto
+            ledcWrite(pwmChannelOpen, pwm_open);
+            ledcWrite(pwmChannelClose, 0);
+            delay(80);  // Tiempo aumentado para mejor estabilización
+            // Actualizar barra de progreso
+            int bar_width = map(pwm_open, 0, 255, 0, 96);
+            if (bar_width > last_bar_width) {
+                last_bar_width = bar_width;
+                oledDisplay.fillRect(22, 17, bar_width, 21, SSD1306_BLACK);
+                oledDisplay.drawRect(22, 17, bar_width, 21, SSD1306_WHITE);
+            }
+            // Actualizar valores en pantalla
+            oledDisplay.fillRect(0, 45, 128, 19, SSD1306_BLACK);
+            oledDisplay.setCursor(0, 45);
+            oledDisplay.printf("PWM: %d", pwm_open);
+            oledDisplay.setCursor(0, 55);
+            oledDisplay.printf("Z/M Abrir: ---");
+            oledDisplay.display();
+            // MEJORA 2: Detección más robusta con múltiples lecturas
+            long current_count = getEncoderCount();
+            long delta = abs(current_count - prev_encoder_count);
+            // MEJORA 3: Umbral adaptativo basado en el PWM actual
+            int threshold = 2 + (pwm_open / 50);  // Umbral que aumenta con PWM
+            if (delta > threshold) {
+                // Confirmación adicional - verificar movimiento sostenido
+                delay(100);
+                long new_count = getEncoderCount();
+                if (abs(new_count - current_count) > 0) {
+                    found_deadzone_open = true;
+                    deadzone_open = pwm_open;
+                    // Destacar visualmente el valor detectado
+                    oledDisplay.fillRect(22, 17, bar_width, 21, SSD1306_WHITE);
+                    oledDisplay.fillRect(bar_width + 22, 17, 96 - bar_width, 21, SSD1306_BLACK);
+                    oledDisplay.setCursor(0, 55);
+                    // MEJORA 4: Visualización CLARA del valor exacto detectado
+                    oledDisplay.fillRect(0, 45, 128, 19, SSD1306_WHITE);
+                    oledDisplay.setTextColor(SSD1306_BLACK);
+                    oledDisplay.setCursor(0, 45);
+                    oledDisplay.print("ZONA MUERTA DETECTADA!");
+                    oledDisplay.setCursor(0, 55);
+                    oledDisplay.printf("Z/M Abrir: %d PWM <--", deadzone_open);
+                    oledDisplay.setTextColor(SSD1306_WHITE);
+                    oledDisplay.display();
+                    // Detener motor para pasar a la siguiente fase
+                    Serial.printf("\n¡ZONA MUERTA APERTURA: %d PWM!\n", deadzone_open);
+                    ledcWrite(pwmChannelClose, 0);
+                    // MEJORA 5: No continuar con revolución completa, solo verificar
+                    delay(3000);  // Tiempo suficiente para observar el valor
+                    prev_encoder_count = current_count;
+                    // Detener motor para pasar a la siguiente fase
+                    ledcWrite(pwmChannelOpen, 0);
+                }
+            } else {
+                prev_encoder_count = current_count;
+            }
+        }
+        // Si no se encontró zona muerta, mostrar advertencia
+        if (!found_deadzone_open) {
+            oledDisplay.fillRect(0, 45, 128, 19, SSD1306_WHITE);
+            oledDisplay.setTextColor(SSD1306_BLACK);
+            oledDisplay.setCursor(0, 45);
+            oledDisplay.print("DETECCIÓN FALLIDA");
+            oledDisplay.setCursor(0, 55);
+            oledDisplay.print("Usando valor seguro: 45");
+            oledDisplay.setTextColor(SSD1306_WHITE);
+            oledDisplay.display();
+            deadzone_open = 45;
+            Serial.println("No se detectó zona muerta en APERTURA. Usando valor predeterminado: 45");
+            delay(3000);
+        }
+        // ===== FASE 2: Detectar zona muerta para CIERRE =====
+        // Detener motor entre fases
+        ledcWrite(pwmChannelOpen, 0);
+        ledcWrite(pwmChannelClose, 0);
+        delay(1000);
+        
+        prev_encoder_count = encoder_count;
+        pwm_close = 0;
+        last_bar_width = 0;
+        found_deadzone_close = false;
+        // Preparar gráfica de progreso para CIERRE
+        oledDisplay.clearDisplay();
+        oledDisplay.setCursor(0, 0);
+        oledDisplay.setTextSize(2);
+        oledDisplay.println("Z/M CERRAR");
+        oledDisplay.setTextSize(1);
+        oledDisplay.setCursor(0, 40);
+        oledDisplay.drawRect(20, 15, 100, 25, SSD1306_WHITE);
+        oledDisplay.setCursor(0, 15);
+        oledDisplay.print("0");
+        oledDisplay.setCursor(122, 15);
+        oledDisplay.print("255");
+        oledDisplay.setCursor(0, 40);
+        oledDisplay.print("PWM");
+        oledDisplay.display();
+        
+        // Código similar para la detección de cierre (igual de preciso)
+        for (pwm_close = 0; pwm_close <= 255 && !found_deadzone_close; pwm_close += 1) {
+            ledcWrite(pwmChannelOpen, 0);
+            ledcWrite(pwmChannelClose, pwm_close);
+            delay(80);
+            int bar_width = map(pwm_close, 0, 255, 0, 96);
+            if (bar_width > last_bar_width) {
+                last_bar_width = bar_width;
+                oledDisplay.fillRect(22, 17, bar_width, 21, SSD1306_BLACK);
+                oledDisplay.drawRect(22, 17, bar_width, 21, SSD1306_WHITE);
+            }
+            oledDisplay.display();
+            oledDisplay.fillRect(0, 45, 128, 19, SSD1306_BLACK);
+            oledDisplay.setCursor(0, 45);
+            oledDisplay.printf("PWM: %d", pwm_close);
+            oledDisplay.setCursor(0, 55);
+            oledDisplay.printf("Z/M Cerrar: ---");
+            oledDisplay.display();
+            // Detección mejorada para cierre
+            long current_count = getEncoderCount();
+            long delta = abs(current_count - prev_encoder_count);
+            int threshold = 2 + (pwm_close / 50);
+            if (delta > threshold) {
+                // Confirmación adicional
+                delay(100);
+                long new_count = getEncoderCount();
+                if (abs(new_count - current_count) > 0) {
+                    found_deadzone_close = true;
+                    deadzone_close = pwm_close;
+                    // Destacar el valor detectado
+                    oledDisplay.fillRect(22, 17, bar_width, 21, SSD1306_WHITE);
+                    oledDisplay.fillRect(bar_width + 22, 17, 96 - bar_width, 21, SSD1306_BLACK);
+                    oledDisplay.printf("Z/M Cerrar: %d PWM <--", deadzone_close);
+                    oledDisplay.fillRect(0, 45, 128, 19, SSD1306_WHITE);
+                    oledDisplay.setTextColor(SSD1306_BLACK);
+                    oledDisplay.setCursor(0, 45);
+                    oledDisplay.print("ZONA MUERTA DETECTADA!");
+                    oledDisplay.setCursor(0, 55);
+                    oledDisplay.printf("Z/M Cerrar: %d PWM <--", deadzone_close);
+                    oledDisplay.setTextColor(SSD1306_WHITE);
+                    oledDisplay.display();
+                    ledcWrite(pwmChannelOpen, 0);
+                    Serial.printf("\n¡ZONA MUERTA CIERRE: %d PWM!\n", deadzone_close);
+                    delay(3000);
+                    prev_encoder_count = current_count;
+                    // Detener motor sin revolución completa
+                    ledcWrite(pwmChannelOpen, 0);
+                    ledcWrite(pwmChannelClose, 0);
+                }
+            } else {
+                prev_encoder_count = current_count;
+            }
+        }
+        // Si no se encontró zona muerta en cierre
+        if (!found_deadzone_close) {
+            oledDisplay.fillRect(0, 45, 128, 19, SSD1306_WHITE);
+            oledDisplay.setTextColor(SSD1306_BLACK);
+            oledDisplay.setCursor(0, 45);
+            oledDisplay.print("DETECCIÓN FALLIDA");
+            oledDisplay.setCursor(0, 55);
+            oledDisplay.print("Usando valor seguro: 45");
+            oledDisplay.setTextColor(SSD1306_WHITE);
+            oledDisplay.display();
+            deadzone_close = 45;
+            Serial.println("No se detectó zona muerta en CIERRE. Usando valor predeterminado: 45");
+            delay(3000);
+        }
+        // Calcular deadzone promedio para PID
+        // Detener motor
+        ledcWrite(pwmChannelOpen, 0);
+        ledcWrite(pwmChannelClose, 0);
+        delay(1000);
+        
+        deadzone = (deadzone_open + deadzone_close) / 2.0;
+        // Mostrar resultados
+        // Calcular parámetros PID sugeridos basados en zona muerta
+        float new_Kp = 0.01f * deadzone;
+        float new_Ki = 0.001f * deadzone;
+        float new_Kd = 0.1f * deadzone;
+        
+        // Mostrar resultados
+        if(!mostrarResumenAutotuningSafe(1, deadzone_open, deadzone_close, deadzone, rps_positive, rps_negative)) {
+            Serial.println("Error al mostrar resumen de autotuning");
+        }
+        delay(3000);
+        // Guardar valores en variables globales
+        if(!mostrarResumenAutotuningSafe(2, new_Kp, new_Ki, new_Kd, 0, 0)) {
+            Serial.println("Error al mostrar parámetros PID");
+        }
+        delay(3000);
+        // Animar guardado y almacenar en EEPROM
+        // Guardar valores en variables globales
+        Kp = new_Kp;
+        Ki = new_Ki;
+        Kd = new_Kd;
+        
+        // Animar guardado y almacenar en EEPROM
+        mostrarAnimacionGuardadoSafe();
+        if(!guardarValoresPID()) {
+            Serial.println("Error al guardar valores en EEPROM");
+        }
+        
+    } catch (const std::exception& e) {
+        Serial.println("Error en autoTune: " + String(e.what()));
+        ledcWrite(pwmChannelOpen, 0);
+        ledcWrite(pwmChannelClose, 0);
+    }
+} 
+
+  // Versión segura de mostrarResumenAutotuning
+bool mostrarResumenAutotuningSafe(int pagina, float val1, float val2, float val3, float val4, float val5) {
+    try {
+        oledDisplay.clearDisplay();
+        oledDisplay.setTextSize(1);
+        oledDisplay.drawLine(0, 9, 128, 9, SSD1306_WHITE);
+        oledDisplay.setCursor(0, 0);
+        if (pagina == 1) {
+            oledDisplay.println("AUTOTUNING COMPLETO");
+            oledDisplay.setCursor(0, 12);
+            oledDisplay.printf("Z/M Abrir: %d", (int)val1);
+            oledDisplay.setCursor(0, 22);
+            oledDisplay.printf("Z/M Cerrar: %d", (int)val2);
+            oledDisplay.setCursor(0, 32);
+            oledDisplay.printf("Z/M Prom: %.1f", val3);
+            oledDisplay.setCursor(0, 42);
+            oledDisplay.printf("RPS +/-: %.2f/%.2f", val4, val5);
+            oledDisplay.setCursor(0, 54);
+            oledDisplay.println("[ 1/2 ] Espere...");
+        } else {
+            oledDisplay.setCursor(0, 0);
+            oledDisplay.println("PARAMETROS PID");
+            oledDisplay.setCursor(0, 12);
+            oledDisplay.printf("Kp: %.4f", val1);
+            oledDisplay.setCursor(0, 22);
+            oledDisplay.printf("Ki: %.4f", val2);
+            oledDisplay.setCursor(0, 32);
+            oledDisplay.printf("Kd: %.2f", val3);
+            
+            // Barra de progreso más simple para evitar problemas de memoria
+            oledDisplay.drawRect(0, 45, 128, 10, SSD1306_WHITE);
+            oledDisplay.fillRect(2, 47, 124, 6, SSD1306_WHITE);
+            oledDisplay.setCursor(0, 56);
+            oledDisplay.println("[ 2/2 ] Valores OK!");
+        }
+        
+        oledDisplay.display();
+        return true;
+    } catch (...) {
+        Serial.println("Error en mostrarResumenAutotuningSafe");
+        return false;
+    }
+} 
+
+  // Versión mejorada de la animación de guardado
+void mostrarAnimacionGuardadoSafe() {
+    try {
+        for (int i = 0; i < 5; i++) {
+            // No limpiar toda la pantalla, solo la línea de estado
+            oledDisplay.fillRect(0, 56, 128, 8, SSD1306_BLACK);
+            oledDisplay.setCursor(0, 56);
+            
+            if (i % 2 == 0) {
+                oledDisplay.println("Guardando...");
+            } else {
+                oledDisplay.println("            ");
+            }
+            
+            oledDisplay.display();
+            delay(300);
+        }
+    } catch (...) {
+        Serial.println("Error en animación de guardado");
+    }
+} 
+
+  // Función ejecutada en núcleo dedicado para procesamiento del encoder
+  void encoderProcessingTask(void *pvParameters) {
+     long last_encoder_count = 0;
+     unsigned long last_calc_time = 0;
+     Serial.println("Tarea de procesamiento de encoder iniciada en núcleo dedicado");
+     // Configuración de prioridad alta para procesamiento del encoder
+     vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+     while(true) {
+         // Bloquear acceso a datos compartidos
+         if (xSemaphoreTake(encoderSemaphore, portMAX_DELAY) == pdTRUE) {
+             // Copiar valor actual del encoder (protegido)
+             encoderSharedData.count = _encoder_count;
+             unsigned long current_time = millis();
+             unsigned long delta_time = current_time - encoderSharedData.last_time;
+             // Procesamiento de velocidad cada 50ms
+             if (delta_time >= 50) {
+                 long delta = encoderSharedData.count - encoderSharedData.last_count;
+                 float instant_rps = ((float)delta * 1000.0) / (delta_time * encoder_ppr);
+                 encoderSharedData.last_time = current_time;
+                 // Filtrado avanzado (menor sensibilidad a ruido)
+                 static float filtered_rps = 0;
+                 filtered_rps = filtered_rps * 0.8 + instant_rps * 0.2;
+                 encoderSharedData.current_rps = filtered_rps;
+                 encoderSharedData.last_count = encoderSharedData.count;
+                 encoderSharedData.last_time = current_time;
+                 encoderSharedData.data_ready = true;
+                 // Debug detallado si hay movimiento significativo
+                 if (abs(instant_rps) > 0.1) {
+                     String direccion = instant_rps < 0 ? "APERTURA" : "CIERRE";
+                     Serial.printf("[CORE %d] DIR: %s (%.2f RPS) - encoder:%ld\n", 
+                                   xPortGetCoreID(), direccion.c_str(),  
+                                   instant_rps, encoderSharedData.count);
+                 }
+             }
+             xSemaphoreGive(encoderSemaphore);
+         }
+         // Tiempo crítico de espera (1ms) para bajo consumo sin sacrificar precisión
+         vTaskDelay(1 / portTICK_PERIOD_MS);
+     }
+} 
+
+  // Obtener conteo seguro entre núcleos
+  long getEncoderCount() {
+     long count = 0;
+     if (xSemaphoreTake(encoderSemaphore, portMAX_DELAY) == pdTRUE) {
+         count = encoderSharedData.count;
+         xSemaphoreGive(encoderSemaphore);
+     }
+     return count;
+} 
+
+  // Leer la velocidad calculada de forma segura
+  float getEncoderRPS() {
+     float rps = 0;
+     if (xSemaphoreTake(encoderSemaphore, portMAX_DELAY) == pdTRUE) {
+         rps = encoderSharedData.current_rps;
+         xSemaphoreGive(encoderSemaphore);
+     }
+     return rps;
+} 
+
+  // Implementar función faltante actualizarEncoderCount() de manera segura
+  void actualizarEncoderCount() {
+     // Actualiza la variable global encoder_count desde la versión protegida
+     encoder_count = getEncoderCount();
+} 
+
+  // Nueva función para reiniciar el contador del encoder de manera segura
+  void resetEncoderCount() {
+     if (xSemaphoreTake(encoderSemaphore, portMAX_DELAY) == pdTRUE) {
+         _encoder_count = 0;  // Variable primaria que cuenta los pulsos
+         encoderSharedData.count = 0;  // Estructura compartida entre núcleos
+         encoderSharedData.last_count = 0;  // Para cálculos de velocidad
+         encoderSharedData.current_rps = 0.0;
+         xSemaphoreGive(encoderSemaphore);
+     }
+     encoder_count = 0;  // Variable de interfaz con el código existente
+     Serial.println("Contador de encoder reiniciado a cero de forma sincronizada");
+} 
+
+  // Modificación del guardado en EEPROM
+  bool guardarValoresPID() {
+    // Evitamos valores inválidos antes de guardar
+    if (isnan(Kp) || Kp <= 0.0) Kp = 0.01;
+    if (isnan(Ki) || Ki < 0.0) Ki = 0.001;
+    if (isnan(Kd) || Kd < 0.0) Kd = 50.0;
+    if (isnan(deadzone) || deadzone < 5.0) deadzone = 35.0;
+    // Serializar valores antes de guardar
+    Serial.printf("Guardando valores: Kp=%.5f, Ki=%.5f, Kd=%.2f, deadzone=%.1f\n", 
+                  Kp, Ki, Kd, deadzone);
+    
+    // Guardar cada valor individualmente con verificación
+    EEPROM.put(EEPROM_KP_ADDR, Kp);
+    EEPROM.put(EEPROM_KI_ADDR, Ki);
+    EEPROM.put(EEPROM_KD_ADDR, Kd);
+    EEPROM.put(EEPROM_DEADZONE_ADDR, deadzone);
+    // Guardar los valores individuales de zona muerta
+    EEPROM.put(16, deadzone_open);
+    EEPROM.put(20, deadzone_close);
+    // Verificar guardado después de EEPROM.commit()
+    if (!EEPROM.commit()) {
+        Serial.println("ERROR: Fallo al guardar en EEPROM");
+        return false;
+    }
+    // Verificar guardado después de EEPROM.commit()
+    float kp_test = 0.0;
+    EEPROM.get(EEPROM_KP_ADDR, kp_test);
+    if (abs(kp_test - Kp) > 0.0001) {
+        Serial.println("ADVERTENCIA: Verificación de EEPROM falló");
+        return false;
+    }
+    return true;
+}
+
+// Nueva función para leer el movimiento del encoder
+int leerMovimientoEncoder() {
+    static int lastState = 0; // Estado anterior del encoder
+    static int pulseCount = 0; // Contador de pulsos
+    int currentState = digitalRead(MENU_ENC_A) | (digitalRead(MENU_ENC_B) << 1); // Leer estado actual
+    int movimiento = 0;
+
+    // Detectar movimiento horario
+    if ((lastState == 0b00 && currentState == 0b01) ||
+        (lastState == 0b01 && currentState == 0b11) ||
+        (lastState == 0b11 && currentState == 0b10) ||
+        (lastState == 0b10 && currentState == 0b00)) {
+        pulseCount++; // Incrementar contador de pulsos
+        if (pulseCount >= 2) { // Cambiar selección cada 2 pulsos
+            movimiento = 1; // Movimiento horario
+            pulseCount = 0; // Reiniciar contador
+        }
+    }
+    // Detectar movimiento antihorario
+    else if ((lastState == 0b00 && currentState == 0b10) ||
+             (lastState == 0b10 && currentState == 0b11) ||
+             (lastState == 0b11 && currentState == 0b01) ||
+             (lastState == 0b01 && currentState == 0b00)) {
+        pulseCount++; // Incrementar contador de pulsos
+        if (pulseCount >= 2) { // Cambiar selección cada 2 pulsos
+            movimiento = -1; // Movimiento antihorario
+            pulseCount = 0; // Reiniciar contador
+        }
+    }
+
+    // Actualizar el estado anterior
+    lastState = currentState;
+
+    return movimiento;
+}
+
+
+
+
+___________________________________________________________________________________________________________________________________________________________________________________________________________________________
+**programa menu1**
+
+
+
+
+
+#include <EEPROM.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define EEPROM_SIZE 112
+#define BLINK_INTERVAL_SELECTION 500
+#define BLINK_INTERVAL_EDIT 200
+
+#define ENCODER_PIN_A 22
+#define ENCODER_PIN_B 23
+#define BUTTON_PIN    21
+
+Adafruit_SSD1306 oledDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Variables para Menú 1 (VA1–VA7)
+int horizontalOffsets[7] = {0, 0, 0, 0, 0, 0, 0};
+int verticalOffsets[7]   = {0, 0, 0, 0, 0, 0, 0};
+volatile int menuPos     = 0;
+volatile int menuImpulsos = 0;
+int editMode            = 0; // 0=selección, 1=vertical, 2=horizontal
+bool blinkState         = false;
+unsigned long lastBlink = 0;
+volatile int encoderDelta = 0;
+
+// --- EEPROM ---
+void cargarPosicionesEEPROM() {
+    EEPROM.begin(EEPROM_SIZE);
+    for (int i = 0; i < 7; i++) {
+        EEPROM.get(i * 4, horizontalOffsets[i]);
+        EEPROM.get((i + 7) * 4, verticalOffsets[i]);
+    }
+}
+void guardarPosicionesEEPROM() {
+    for (int i = 0; i < 7; i++) {
+        EEPROM.put(i * 4, horizontalOffsets[i]);
+        EEPROM.put((i + 7) * 4, verticalOffsets[i]);
+    }
+    EEPROM.commit();
+}
+
+// --- Encoder ISR ---
+void IRAM_ATTR encoderISR() {
+    static byte prev = 0;
+    byte now = (digitalRead(ENCODER_PIN_A)<<1) | digitalRead(ENCODER_PIN_B);
+    int dir = 0;
+    if (prev==0b00 && now==0b01) dir=1;
+    else if (prev==0b00 && now==0b10) dir=-1;
+    else if (prev==0b01 && now==0b11) dir=1;
+    else if (prev==0b01 && now==0b00) dir=-1;
+    else if (prev==0b11 && now==0b10) dir=1;
+    else if (prev==0b11 && now==0b01) dir=-1;
+    else if (prev==0b10 && now==0b00) dir=1;
+    else if (prev==0b10 && now==0b11) dir=-1;
+    prev = now;
+    encoderDelta += dir;
+}
+
+// --- Botón ISR ---
+void IRAM_ATTR buttonISR() {
+    if (menuPos < 7) {
+        editMode = (editMode + 1) % 3;
+    }
+}
+
+// --- Menú 1 ---
+void mostrarMenu1() {
+    oledDisplay.clearDisplay();
+    oledDisplay.setTextSize(1);
+    oledDisplay.setTextColor(SSD1306_WHITE);
+
+    // Parpadeo dependiente del modo
+    unsigned long interval = (editMode == 0) ? BLINK_INTERVAL_SELECTION : BLINK_INTERVAL_EDIT;
+    if (millis() - lastBlink > interval) {
+        blinkState = !blinkState;
+        lastBlink = millis();
+    }
+
+    // Ejes
+    oledDisplay.drawLine(0, SCREEN_HEIGHT-1, SCREEN_WIDTH, SCREEN_HEIGHT-1, SSD1306_WHITE);
+    oledDisplay.drawLine(0, 10, 0, SCREEN_HEIGHT, SSD1306_WHITE);
+
+    // Puntos y conexiones
+    int prevX=0, prevY=0;
+    const char* names[7] = { "VA1","VA2","VA3","VA4","VA5","VA6","VA7" };
+    int textLineSpace = 12;
+    for(int i=0; i<7; i++){
+        int x = (i+1)*(SCREEN_WIDTH/8) + horizontalOffsets[i];
+        int y = SCREEN_HEIGHT - constrain(
+            verticalOffsets[i] * (SCREEN_HEIGHT - textLineSpace) / 255,
+            0, SCREEN_HEIGHT - textLineSpace
+        );
+        if (!(menuPos==i && blinkState)) {
+            oledDisplay.fillCircle(x, y, (menuPos==i ? 2 : 1), SSD1306_WHITE);
+        }
+        if(i>0) oledDisplay.drawLine(prevX, prevY, x, y, SSD1306_WHITE);
+        prevX = x;  prevY = y;
+    }
+
+    // Etiqueta y valor
+    oledDisplay.setCursor(0,0);
+    if(editMode==0 && menuPos < 7) {
+        oledDisplay.print(names[menuPos]);
+    }
+    else if(editMode==1 && menuPos < 7) {
+        oledDisplay.printf("%s: %03dV", names[menuPos], verticalOffsets[menuPos]);
+    }
+    else if(editMode==2 && menuPos < 7) {
+        int pct = ((horizontalOffsets[menuPos] + (menuPos+1)*(SCREEN_WIDTH/8)) * 100) / SCREEN_WIDTH;
+        oledDisplay.printf("%s: %03d%%", names[menuPos], pct);
+    }
+
+    // --- Símbolos en la esquina superior derecha ---
+    int symbolY = 0;
+    int symbolX = SCREEN_WIDTH - 75; // Ajuste para 128px y fuente tamaño 1
+
+    oledDisplay.setCursor(symbolX, symbolY);
+
+    // "<>"
+    if (menuPos == 7 && editMode == 0 && blinkState) {
+        oledDisplay.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        oledDisplay.print("<>");
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    } else {
+        oledDisplay.print("<>");
+    }
+    oledDisplay.print("  ");
+
+    // "><"
+    if (menuPos == 8 && editMode == 0 && blinkState) {
+        oledDisplay.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        oledDisplay.print("><");
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    } else {
+        oledDisplay.print("><");
+    }
+    oledDisplay.print("    ");
+
+    // ">"
+    if (menuPos == 9 && editMode == 0 && blinkState) {
+        oledDisplay.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        oledDisplay.print(">");
+        oledDisplay.setTextColor(SSD1306_WHITE);
+    } else {
+        oledDisplay.print(">");
+    }
+
+    oledDisplay.display();
+}
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    Wire.setPins(32, 33);   // <-- Añade esta línea
+    Wire.begin();           // <-- Así usas tus pines reales
+    if(!oledDisplay.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("SSD1306 allocation failed");
+        while(1);
+    }
+    delay(100);
+    oledDisplay.clearDisplay();
+    oledDisplay.display();
+
+    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+    pinMode(BUTTON_PIN,    INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN),    buttonISR,  FALLING);
+
+    cargarPosicionesEEPROM();
+}
+
+// --- Loop ---
+// Cambia el rango de menuPos de 0 a 9 (7 puntos + 3 símbolos)
+void loop() {
+    // Procesa encoder
+    noInterrupts();
+    int delta = encoderDelta;
+    interrupts();
+
+    // Procesa todos los pasos completos de 4 impulsos
+    while (abs(delta) >= 4) {
+        if (editMode == 0) {
+            int paso = (delta > 0) ? 1 : -1;
+            menuPos = (menuPos + paso + 10) % 10; // 0-9 cíclico
+            delta += (delta > 0) ? -4 : 4;
+        }
+        else if (editMode == 1 && menuPos < 7) {
+            int paso = (delta > 0) ? 1 : -1;
+            verticalOffsets[menuPos] = constrain(verticalOffsets[menuPos] + paso, 0, 255);
+            delta += (delta > 0) ? -4 : 4;
+        }
+        else if (editMode == 2 && menuPos < 7) {
+            int paso = (delta > 0) ? 1 : -1;
+            int baseX = (menuPos + 1) * (SCREEN_WIDTH / 8);
+            int leftLim = (menuPos > 0) ? (menuPos * (SCREEN_WIDTH / 8) + horizontalOffsets[menuPos - 1]) : 0;
+            int rightLim = (menuPos < 6) ? ((menuPos + 2) * (SCREEN_WIDTH / 8) + horizontalOffsets[menuPos + 1]) : SCREEN_WIDTH;
+            horizontalOffsets[menuPos] = constrain(
+                horizontalOffsets[menuPos] + paso,
+                leftLim - baseX,
+                rightLim - baseX
+            );
+            delta += (delta > 0) ? -4 : 4;
+        }
+        guardarPosicionesEEPROM();
+    }
+
+    // Actualiza el acumulador global SOLO cuando terminas de procesar
+    noInterrupts();
+    encoderDelta = delta;
+    interrupts();
+
+    mostrarMenu1();
+    delay(20);
+}
