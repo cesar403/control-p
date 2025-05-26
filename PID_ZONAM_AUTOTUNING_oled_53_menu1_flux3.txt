@@ -1,7 +1,7 @@
-**asegurate de no modificar este archivo**
+
 
 1- adapta el programa de menu 1 al programa peincipal de forma que no interfiera con el 
-actual 
+actual requiero que el menu 1 lo integres a mi programa principal. con toda su logica y funcionalidad 
 
 
 
